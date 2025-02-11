@@ -15,9 +15,19 @@ Velocis is a high-performance data structure library for efficient caching and o
 To use Velocis in your project, include it as a dependency:
 
 ```xml
+<repositories>
+    <repository>
+        <id>jitpack.io</id>
+        <url>https://jitpack.io</url>
+    </repository>
+</repositories>
+
+
 <dependency>
     <groupId>com.github.FlameyosSnowy</groupId>
     <artifactId>Velocis</artifactId>
     <version>1.0.0</version>
 </dependency>
 ```
+
+
