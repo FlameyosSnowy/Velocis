@@ -44,7 +44,7 @@ public class ConcurrentLFUCache<K, V> implements Map<K, V> {
 
         cache.put(key, value);
         frequency.put(key, 1);
-        evictionQueue.offer(key);
+        evictionQueue.add(key);
         return value;
     }
 
@@ -107,12 +107,13 @@ public class ConcurrentLFUCache<K, V> implements Map<K, V> {
     private void incrementFrequency(K key) {
         frequency.put(key, frequency.getOrDefault(key, 0) + 1);
         evictionQueue.remove(key);
-        evictionQueue.offer(key);
+        evictionQueue.add(key);
     }
 
     private void evictLFU() {
         if (!evictionQueue.isEmpty()) {
-            K leastUsedKey = evictionQueue.poll();
+            K leastUsedKey = evictionQueue.first();
+            evictionQueue.remove(leastUsedKey);
             if (leastUsedKey != null) {
                 cache.remove(leastUsedKey);
                 frequency.remove(leastUsedKey);
