@@ -29,13 +29,13 @@ public interface Multimap<K, V> extends Map<K, List<V>> {
         return values;
     }
 
-    default V getFirstElement(K key) {
+    default V getFirst(K key) {
         List<V> values = get(key);
         if (values == null) return null;
         return values.get(0);
     }
 
-    default V getLastElement(K key) {
+    default V getLast(K key) {
         List<V> values = get(key);
         if (values == null) return null;
         return values.get(values.size() - 1);
