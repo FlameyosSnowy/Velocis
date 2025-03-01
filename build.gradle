@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'io.github.flameyossnowy.velocis'
-version = '1.0.0'
+version = '1.1.0'
 
 repositories {
     mavenCentral()
@@ -13,3 +13,5 @@ dependencies {
     /*testImplementation platform('org.junit:junit-bom:5.10.0')
     testImplementation 'org.junit.jupiter:junit-jupiter'*/
 }
+
+java.toolchain.languageVersion.set(JavaLanguageVersion.of(17));
