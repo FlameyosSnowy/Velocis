@@ -1,4 +1,4 @@
-package io.github.flameyossnowy.velocis.cache;
+package io.github.flameyossnowy.velocis.cache.algorithms;
 
 import java.util.concurrent.atomic.AtomicReference;
 

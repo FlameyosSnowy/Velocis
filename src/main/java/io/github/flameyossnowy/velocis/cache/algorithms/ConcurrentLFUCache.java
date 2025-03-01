@@ -1,9 +1,9 @@
-package io.github.flameyossnowy.velocis.cache;
+package io.github.flameyossnowy.velocis.cache.algorithms;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
-import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class ConcurrentLFUCache<K, V> implements Map<K, V> {
     private final int maxSize;
@@ -11,12 +11,32 @@ public class ConcurrentLFUCache<K, V> implements Map<K, V> {
     private final Map<K, Integer> frequency;
     private final ConcurrentSkipListSet<K> evictionQueue;
 
-    public ConcurrentLFUCache(int maxSize) {
+    private static final int INITIAL_CONCURRENCY_LEVEL = 1;
+    private static final int INITIAL_CAPACITY = 16;
+    private static final float INITIAL_LOAD_FACTOR =  0.75F;
+
+    public ConcurrentLFUCache(int maxSize, int concurrencyLevel, float loadFactor) {
         if (maxSize <= 0) throw new IllegalArgumentException("Cache size must be greater than 0");
         this.maxSize = maxSize;
-        this.cache = new ConcurrentHashMap<>();
-        this.frequency = new ConcurrentHashMap<>();
+        this.cache = new ConcurrentHashMap<>(concurrencyLevel, loadFactor);
+        this.frequency = new ConcurrentHashMap<>(concurrencyLevel, loadFactor);
         this.evictionQueue = new ConcurrentSkipListSet<>(Comparator.comparingInt(frequency::get));
+    }
+
+    public ConcurrentLFUCache(int maxSize, int concurrencyLevel) {
+        this(maxSize, concurrencyLevel, INITIAL_LOAD_FACTOR);
+    }
+
+    public ConcurrentLFUCache(int maxSize, float loadFactor) {
+        this(maxSize, INITIAL_CONCURRENCY_LEVEL, loadFactor);
+    }
+
+    public ConcurrentLFUCache(int maxSize) {
+        this(maxSize, INITIAL_CONCURRENCY_LEVEL, INITIAL_LOAD_FACTOR);
+    }
+
+    public ConcurrentLFUCache() {
+        this(INITIAL_CAPACITY, INITIAL_CONCURRENCY_LEVEL, INITIAL_LOAD_FACTOR);
     }
 
     @Override

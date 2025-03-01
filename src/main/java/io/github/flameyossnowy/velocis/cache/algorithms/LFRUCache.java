@@ -1,4 +1,4 @@
-package io.github.flameyossnowy.velocis.cache;
+package io.github.flameyossnowy.velocis.cache.algorithms;
 
 import java.util.*;
 
@@ -68,11 +68,17 @@ public class LFRUCache<K, V> implements Map<K, V> {
     private final Map<K, Map.Entry<K, V>> cache;
     private final TreeMap<Integer, DoublyLinkedList<K, V>> frequencyBuckets;
 
+    private static final int DEFAULT_CAPACITY = 16;
+
     public LFRUCache(int capacity) {
         if (capacity <= 0) throw new IllegalArgumentException("Cache size must be greater than 0");
         this.capacity = capacity;
         this.cache = new HashMap<>();
         this.frequencyBuckets = new TreeMap<>();
+    }
+
+    public LFRUCache() {
+        this(DEFAULT_CAPACITY);
     }
 
     public V get(Object key) {

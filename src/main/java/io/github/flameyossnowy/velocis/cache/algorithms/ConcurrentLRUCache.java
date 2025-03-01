@@ -1,82 +1,81 @@
-package io.github.flameyossnowy.velocis.cache;
+package io.github.flameyossnowy.velocis.cache.algorithms;
 
 import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListSet;
 
-@SuppressWarnings({"unchecked", })
-public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
+/**
+ * Raw LRU Cache implementation using a HashMap and Doubly Linked List.
+ * Does NOT rely on LinkedHashMap's accessOrder feature.
+ */
+public class ConcurrentLRUCache<K, V> implements Map<K, V> {
     private final int maxSize;
-    private final ConcurrentHashMap<K, Map.Entry<K, V>> cache;
-    private final ConcurrentHashMap<K, Integer> frequencyMap;
-    private final AtomicReference<Node<K, V>> head;
-    private final AtomicReference<Node<K, V>> tail;
+    private final Map<K, Map.Entry<K, V>> cache;
+    private final ConcurrentDoublyLinkedList<K, V> list;
 
     private Values values;
     private EntrySet entrySet;
 
-    public ConcurrentLFRUCache(int maxSize) {
+    private static final int INITIAL_CONCURRENCY_LEVEL = 1;
+    private static final int INITIAL_CAPACITY = 16;
+    private static final float INITIAL_LOAD_FACTOR =  0.75F;
+
+    public ConcurrentLRUCache(int maxSize, int concurrencyLevel, float loadFactor) {
         if (maxSize <= 0) throw new IllegalArgumentException("Cache size must be greater than 0");
         this.maxSize = maxSize;
-        this.cache = new ConcurrentHashMap<>();
-        this.frequencyMap = new ConcurrentHashMap<>();
-        this.head = new AtomicReference<>(null);
-        this.tail = new AtomicReference<>(null);
+        this.cache = new ConcurrentHashMap<>(concurrencyLevel, loadFactor);
+        this.list = new ConcurrentDoublyLinkedList<>();
     }
 
-    @Override
-    public int size() {
-        return cache.size();
+    public ConcurrentLRUCache(int maxSize, int concurrencyLevel) {
+        this(maxSize, concurrencyLevel, INITIAL_LOAD_FACTOR);
     }
 
-    @Override
-    public boolean isEmpty() {
-        return cache.isEmpty();
+    public ConcurrentLRUCache(int maxSize, float loadFactor) {
+        this(maxSize, INITIAL_CONCURRENCY_LEVEL, loadFactor);
     }
 
-    @Override
-    public boolean containsKey(final Object o) {
-        return cache.containsKey(o);
+    public ConcurrentLRUCache(int maxSize) {
+        this(maxSize, INITIAL_CONCURRENCY_LEVEL, INITIAL_LOAD_FACTOR);
     }
 
-    @Override
-    public boolean containsValue(final Object o) {
-        return cache.containsValue(o);
+    public ConcurrentLRUCache() {
+        this(INITIAL_CAPACITY, INITIAL_CONCURRENCY_LEVEL, INITIAL_LOAD_FACTOR);
     }
 
     @Override
     public V get(Object key) {
+        if (!cache.containsKey(key)) return null;
+
         Node<K, V> node = (Node<K, V>) cache.get(key);
-        if (node == null) return null;
-        incrementFrequency(node);
-        moveToTail(node);
+        list.moveToEnd(node);  // Mark as most recently used
         return node.value;
     }
 
     @Override
     public V put(K key, V value) {
-        Node<K, V> newNode = new Node<>(key, value);
-        Node<K, V> existingNode = (Node<K, V>) cache.putIfAbsent(key, newNode);
-        if (existingNode != null) {
-            existingNode.value = value;
-            incrementFrequency(existingNode);
-            moveToTail(existingNode);
-            return existingNode.value;
+        if (value == null) throw new IllegalArgumentException("Null values are not allowed");
+
+        if (cache.containsKey(key)) {
+            Node<K, V> node = (Node<K, V>) cache.get(key);
+            V temp = node.value;
+            node.value = value;
+            list.moveToEnd(node);
+            return temp;
         }
-        addNodeToTail(newNode);
-        if (cache.size() > maxSize) evictLFRU();
+
+        if (cache.size() >= maxSize) evictLRU();
+
+        Node<K, V> newNode = list.addToEnd(key, value);
+        cache.put(key, newNode);
         return null;
     }
 
     @Override
     public V remove(Object key) {
         Node<K, V> node = (Node<K, V>) cache.remove(key);
-        if (node != null) {
-            removeNode(node);
-            frequencyMap.remove(key);
-            return node.value;
-        }
-        return null;
+        list.remove(node);
+        return node == null ? null : node.value;
     }
 
     @Override
@@ -89,9 +88,7 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
     @Override
     public void clear() {
         cache.clear();
-        frequencyMap.clear();
-        head.set(null);
-        tail.set(null);
+        list.clear();
     }
 
     @Override
@@ -106,65 +103,48 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
 
     @Override
     public Set<Entry<K, V>> entrySet() {
-        return (entrySet == null) ? (entrySet = new EntrySet()) : entrySet;
+        return entrySet == null ? (entrySet = new EntrySet()) : entrySet;
     }
 
-    private void incrementFrequency(Node<K, V> node) {
-        frequencyMap.merge(node.key, 1, Integer::sum);
-        node.frequency = frequencyMap.get(node.key);
+    @Override
+    public int size() {
+        return cache.size();
     }
 
-    private void moveToTail(Node<K, V> node) {
-        if (tail.get() == node) return;
-        removeNode(node);
-        addNodeToTail(node);
+    @Override
+    public boolean containsKey(Object key) {
+        return cache.containsKey(key);
     }
 
-    private void addNodeToTail(Node<K, V> node) {
-        Node<K, V> oldTail;
-        do {
-            oldTail = tail.get();
-            node.prev = oldTail;
-        } while (!tail.compareAndSet(oldTail, node));
-        if (oldTail != null) oldTail.next = node;
-        else head.set(node);
+    @Override
+    public boolean containsValue(final Object o) {
+        return cache.containsValue(o);
     }
 
-    private void removeNode(Node<K, V> node) {
-        Node<K, V> prev = node.prev;
-        Node<K, V> next = node.next;
-        if (prev != null) prev.next = next;
-        else head.set(next);
-        if (next != null) next.prev = prev;
-        else tail.set(prev);
+    @Override
+    public boolean isEmpty() {
+        return cache.isEmpty();
     }
 
-    private void evictLFRU() {
-        Node<K, V> leastUsed = head.get();
-        Node<K, V> current = head.get();
-        while (current != null) {
-            if (current.frequency < leastUsed.frequency) {
-                leastUsed = current;
-            }
-            current = current.next;
-        }
-        if (leastUsed != null) remove(leastUsed.key);
+    private void evictLRU() {
+        Node<K, V> lruNode = list.removeHead();
+        if (lruNode != null) cache.remove(lruNode.key);
     }
 
     private class Values implements Collection<V> {
         @Override
         public int size() {
-            return ConcurrentLFRUCache.this.cache.size();
+            return ConcurrentLRUCache.this.cache.size();
         }
 
         @Override
         public boolean contains(Object o) {
-            return ConcurrentLFRUCache.this.cache.containsValue(o);
+            return ConcurrentLRUCache.this.cache.containsValue(o);
         }
 
         @Override
         public boolean containsAll(Collection<?> c) {
-            return ConcurrentLFRUCache.this.cache.containsValue(c);
+            return ConcurrentLRUCache.this.cache.containsValue(c);
         }
 
         @Override
@@ -189,7 +169,7 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
 
         @Override
         public boolean isEmpty() {
-            return ConcurrentLFRUCache.this.cache.isEmpty();
+            return ConcurrentLRUCache.this.cache.isEmpty();
         }
 
         @Override
@@ -199,12 +179,12 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
 
         @Override
         public Object[] toArray() {
-            return ConcurrentLFRUCache.this.cache.values().toArray();
+            return ConcurrentLRUCache.this.cache.values().toArray();
         }
 
         @Override
         public <T> T[] toArray(T[] a) {
-            return ConcurrentLFRUCache.this.cache.values().toArray(a);
+            return ConcurrentLRUCache.this.cache.values().toArray(a);
         }
 
         @Override
@@ -219,7 +199,7 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
     }
 
     private class ValuesIterator implements Iterator<V> {
-        private final Iterator<Map.Entry<K, V>> iterator = ConcurrentLFRUCache.this.cache.values().iterator();
+        private final Iterator<Map.Entry<K, V>> iterator = ConcurrentLRUCache.this.cache.values().iterator();
 
         @Override
         public boolean hasNext() {
@@ -240,24 +220,24 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
     private class EntrySet implements Set<Entry<K, V>> {
         @Override
         public int size() {
-            return ConcurrentLFRUCache.this.cache.size();
+            return ConcurrentLRUCache.this.cache.size();
         }
 
         @Override
         public boolean contains(Object o) {
-            return ConcurrentLFRUCache.this.cache.containsValue(((Map.Entry<K, V>) o).getValue());
+            return ConcurrentLRUCache.this.cache.containsValue(((Map.Entry<K, V>) o).getValue());
         }
 
         @Override
         public boolean containsAll(Collection<?> c) {
-            return ConcurrentLFRUCache.this.cache.containsValue(c);
+            return ConcurrentLRUCache.this.cache.containsValue(c);
         }
 
         @Override
         public boolean addAll(final Collection<? extends Entry<K, V>> collection) {
             boolean modified = false;
             for (Entry<K, V> entry : collection) {
-                modified |= ConcurrentLFRUCache.this.put(entry.getKey(), entry.getValue()) == null;
+                modified |= ConcurrentLRUCache.this.put(entry.getKey(), entry.getValue()) == null;
             }
             return modified;
         }
@@ -269,10 +249,10 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
                 if (!(o instanceof Map.Entry<?, ?> entry)) {
                     continue;
                 }
-                if (collection.contains(ConcurrentLFRUCache.this.get(entry.getKey()))) {
+                if (collection.contains(ConcurrentLRUCache.this.get(entry.getKey()))) {
                     continue;
                 }
-                modified |= ConcurrentLFRUCache.this.remove(entry.getKey()) != null;
+                modified |= ConcurrentLRUCache.this.remove(entry.getKey()) != null;
             }
             return modified;
         }
@@ -284,45 +264,45 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
                 if (!(o instanceof Map.Entry<?, ?> entry)) {
                     continue;
                 }
-                modified |= ConcurrentLFRUCache.this.remove(entry.getKey()) != null;
+                modified |= ConcurrentLRUCache.this.remove(entry.getKey()) != null;
             }
             return modified;
         }
 
         @Override
         public void clear() {
-            ConcurrentLFRUCache.this.clear();
+            ConcurrentLRUCache.this.clear();
         }
 
         @Override
         public boolean isEmpty() {
-            return ConcurrentLFRUCache.this.cache.isEmpty();
+            return ConcurrentLRUCache.this.cache.isEmpty();
         }
 
         @Override
         public Iterator<Entry<K, V>> iterator() {
-            return ConcurrentLFRUCache.this.cache.values().iterator();
+            return ConcurrentLRUCache.this.cache.values().iterator();
         }
 
         @Override
         public Object[] toArray() {
-            return ConcurrentLFRUCache.this.cache.values().toArray();
+            return ConcurrentLRUCache.this.cache.values().toArray();
         }
 
         @Override
         public <T> T[] toArray(final T[] ts) {
-            return ConcurrentLFRUCache.this.cache.values().toArray(ts);
+            return ConcurrentLRUCache.this.cache.values().toArray(ts);
         }
 
         @Override
         public boolean add(final Entry<K, V> kvEntry) {
-            return ConcurrentLFRUCache.this.put(kvEntry.getKey(), kvEntry.getValue()) == null;
+            return ConcurrentLRUCache.this.put(kvEntry.getKey(), kvEntry.getValue()) == null;
         }
 
         @Override
         public boolean remove(final Object o) {
             Map.Entry<K, V> entry = (Map.Entry<K, V>) o;
-            return ConcurrentLFRUCache.this.remove(entry.getKey()) != null;
+            return ConcurrentLRUCache.this.remove(entry.getKey()) != null;
         }
     }
 }

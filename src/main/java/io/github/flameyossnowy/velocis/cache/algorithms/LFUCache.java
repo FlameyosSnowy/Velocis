@@ -1,4 +1,4 @@
-package io.github.flameyossnowy.velocis.cache;
+package io.github.flameyossnowy.velocis.cache.algorithms;
 
 import java.util.*;
 
@@ -12,12 +12,18 @@ public class LFUCache<K, V> implements Map<K, V> {
     private final Map<K, Integer> frequency;
     private final PriorityQueue<K> evictionQueue;
 
+    private static final int DEFAULT_MAX_SIZE = 16;
+
     public LFUCache(int maxSize) {
         if (maxSize <= 0) throw new IllegalArgumentException("Cache size must be greater than 0");
         this.maxSize = maxSize;
         this.cache = new HashMap<>();
         this.frequency = new HashMap<>();
         this.evictionQueue = new PriorityQueue<>(Comparator.comparingInt(frequency::get));
+    }
+
+    public LFUCache() {
+        this(DEFAULT_MAX_SIZE);
     }
 
     @Override
