@@ -199,7 +199,15 @@ public class LFRUCache<K, V> implements Map<K, V> {
 
         @Override
         public boolean containsAll(Collection<?> c) {
-            return LFRUCache.this.cache.containsValue(c);
+            for (Object o : c) {
+                if (!(o instanceof Map.Entry<?, ?> entry)) {
+                    return false;
+                }
+                if (!LFRUCache.this.cache.containsValue(entry.getValue())) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         @Override

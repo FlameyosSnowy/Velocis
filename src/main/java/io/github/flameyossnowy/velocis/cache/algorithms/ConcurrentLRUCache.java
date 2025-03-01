@@ -230,7 +230,15 @@ public class ConcurrentLRUCache<K, V> implements Map<K, V> {
 
         @Override
         public boolean containsAll(Collection<?> c) {
-            return ConcurrentLRUCache.this.cache.containsValue(c);
+            for (Object o : c) {
+                if (!(o instanceof Map.Entry<?, ?> entry)) {
+                    return false;
+                }
+                if (!ConcurrentLRUCache.this.cache.containsValue(entry.getValue())) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         @Override
