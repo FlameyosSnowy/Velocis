@@ -1,41 +1,44 @@
 package io.github.flameyossnowy.velocis.cache.algorithms;
 
+import io.github.flameyossnowy.velocis.cache.utils.CountMinSketch;
+
 import java.util.*;
 
 public class LFRUCache<K, V> implements Map<K, V> {
-    private EntrySet entrySet;
-    private Values values;
 
-    private static class Node<K, V> implements Map.Entry<K, V> {
-        K key;
-        V value;
-        int frequency;
-        Node<K, V> prev, next;
+    private static final Object EMPTY     = null;
+    private static final Object TOMBSTONE = new Object();
 
-        Node(K key, V value) {
-            this.key = key;
-            this.value = value;
-            this.frequency = 1;
+    private Object[] keys;
+    private Object[] values;
+    private int[]    hashes;
+
+    private final TreeMap<Integer, FrequencyList> frequencyBuckets;
+
+    private final Map<Integer, FrequencyList.Node> slotToNode;
+
+    private final int               capacity;
+    private int                     size;
+    private final CountMinSketch<K> sketch;
+
+    private static final int DEFAULT_CAPACITY = 16;
+
+    private EntrySet entrySetView;
+    private Values   valuesView;
+    private KeySet   keySetView;
+
+    private static class FrequencyList {
+        static class Node {
+            int  slot;
+            Node prev, next;
+            Node(int slot) { this.slot = slot; }
         }
 
-        @Override
-        public K getKey() { return key; }
+        Node head, tail;
 
-        @Override
-        public V getValue() { return value; }
-
-        @Override
-        public V setValue(V value) {
-            V oldValue = this.value;
-            this.value = value;
-            return oldValue;
-        }
-    }
-
-    private static class DoublyLinkedList<K, V> {
-        private Node<K, V> head, tail;
-
-        void addNode(Node<K, V> node) {
+        /** Appends to tail (most-recently-used end). */
+        Node addSlot(int slot) {
+            Node node = new Node(slot);
             if (head == null) {
                 head = tail = node;
             } else {
@@ -43,329 +46,292 @@ public class LFRUCache<K, V> implements Map<K, V> {
                 node.prev = tail;
                 tail = node;
             }
-        }
-
-        void removeNode(Node<K, V> node) {
-            if (node.prev != null) node.prev.next = node.next;
-            if (node.next != null) node.next.prev = node.prev;
-            if (node == head) head = node.next;
-            if (node == tail) tail = node.prev;
-        }
-
-        boolean isEmpty() {
-            return head == null;
-        }
-
-        Node<K, V> removeHead() {
-            if (head == null) return null;
-            Node<K, V> node = head;
-            removeNode(node);
             return node;
         }
+
+        void removeNode(Node node) {
+            if (node.prev != null) node.prev.next = node.next; else head = node.next;
+            if (node.next != null) node.next.prev = node.prev; else tail = node.prev;
+            node.prev = node.next = null;
+        }
+
+        /** Removes and returns the head slot (least-recently-used at this frequency). */
+        int removeHead() {
+            if (head == null) return -1;
+            Node node = head;
+            removeNode(node);
+            return node.slot;
+        }
+
+        boolean isEmpty() { return head == null; }
     }
-
-    private final int capacity;
-    private final Map<K, Map.Entry<K, V>> cache;
-    private final TreeMap<Integer, DoublyLinkedList<K, V>> frequencyBuckets;
-
-    private static final int DEFAULT_CAPACITY = 16;
 
     public LFRUCache(int capacity) {
         if (capacity <= 0) throw new IllegalArgumentException("Cache size must be greater than 0");
-        this.capacity = capacity;
-        this.cache = new HashMap<>();
+        int tableSize   = nextPowerOfTwo(capacity * 2);
+        this.capacity   = capacity;
+        this.keys       = new Object[tableSize];
+        this.values     = new Object[tableSize];
+        this.hashes     = new int[tableSize];
+        this.sketch     = new CountMinSketch<>();
         this.frequencyBuckets = new TreeMap<>();
+        this.slotToNode = new HashMap<>();
     }
 
     public LFRUCache() {
         this(DEFAULT_CAPACITY);
     }
 
+    @Override
+    @SuppressWarnings("unchecked")
     public V get(Object key) {
-        Node<K, V> node = (Node<K, V>) cache.get(key);
-        if (node == null) return null;
-        updateFrequency(node);
-        return node.value;
-    }
-
-    public V put(K key, V value) {
-        Node<K, V> node = (Node<K, V>) cache.get(key);
-        if (node != null) {
-            node.value = value;
-            updateFrequency(node);
-            return node.value;
-        }
-        if (cache.size() >= capacity) evictLFRU();
-        Node<K, V> newNode = new Node<>(key, value);
-        cache.put(key, newNode);
-        addToFrequencyBucket(newNode);
-        return null;
-    }
-
-    public V remove(Object key) {
-        Node<K, V> node = (Node<K, V>) cache.remove(key);
-        if (node == null) return null;
-        removeFromFrequencyBucket(node);
-        return node.value;
+        int slot = findSlot(key);
+        if (slot < 0) return null;
+        updateFrequency((K) key, slot);
+        return (V) values[slot];
     }
 
     @Override
-    public void putAll(final Map<? extends K, ? extends V> map) {
-        for (Entry<? extends K, ? extends V> entry : map.entrySet()) {
-            this.put(entry.getKey(), entry.getValue());
+    @SuppressWarnings("unchecked")
+    public V put(K key, V value) {
+        if (key   == null) throw new IllegalArgumentException("Null keys are not allowed");
+        if (value == null) throw new IllegalArgumentException("Null values are not allowed");
+
+        int slot = findSlot(key);
+
+        if (slot >= 0) {
+            V old = (V) values[slot];
+            values[slot] = value;
+            updateFrequency(key, slot);
+            return old;
         }
+
+        if (size >= capacity) evictLFRU();
+
+        slot = insertNew(key, value);
+        // New entries start at frequency 1
+        sketch.increment(key);
+        addToFrequencyBucket(slot, 1);
+        return null;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public V remove(Object key) {
+        int slot = findSlot(key);
+        if (slot < 0) return null;
+
+        V old = (V) values[slot];
+        removeFromFrequencyBucket(slot);
+
+        keys[slot]   = TOMBSTONE;
+        values[slot] = EMPTY;
+        hashes[slot] = 0;
+        slotToNode.remove(slot);
+        size--;
+        return old;
+    }
+
+    @Override
+    public boolean containsKey(Object key)   { return findSlot(key) >= 0; }
+
+    @Override
+    public boolean containsValue(Object target) {
+        for (int i = 0; i < keys.length; i++)
+            if (isOccupied(i) && values[i].equals(target)) return true;
+        return false;
+    }
+
+    @Override public int     size()    { return size; }
+    @Override public boolean isEmpty() { return size == 0; }
+
+    @Override
+    public void putAll(Map<? extends K, ? extends V> map) {
+        for (Entry<? extends K, ? extends V> e : map.entrySet()) put(e.getKey(), e.getValue());
     }
 
     @Override
     public void clear() {
-        cache.clear();
+        Arrays.fill(keys,   EMPTY);
+        Arrays.fill(values, EMPTY);
+        Arrays.fill(hashes, 0);
         frequencyBuckets.clear();
+        slotToNode.clear();
+        sketch.clear();
+        size = 0;
     }
 
-    @Override
-    public Set<K> keySet() {
-        return cache.keySet();
+    @Override public Set<K>            keySet()   { return (keySetView  == null) ? (keySetView  = new KeySet())   : keySetView;  }
+    @Override public Collection<V>     values()   { return (valuesView  == null) ? (valuesView  = new Values())   : valuesView;  }
+    @Override public Set<Entry<K, V>>  entrySet() { return (entrySetView == null) ? (entrySetView = new EntrySet()) : entrySetView; }
+
+    @SuppressWarnings("unchecked")
+    private void updateFrequency(K key, int slot) {
+        removeFromFrequencyBucket(slot);
+        sketch.increment(key);
+        int newFreq = sketch.getFrequency(key);
+        addToFrequencyBucket(slot, newFreq);
     }
 
-    @Override
-    public Collection<V> values() {
-        return (this.values == null) ? (this.values = new Values()) : this.values;
+    private void addToFrequencyBucket(int slot, int frequency) {
+        FrequencyList list = frequencyBuckets.computeIfAbsent(frequency, ignored -> new FrequencyList());
+        FrequencyList.Node node = list.addSlot(slot);
+        slotToNode.put(slot, node);
     }
 
-    @Override
-    public Set<Entry<K, V>> entrySet() {
-        return (this.entrySet == null) ? (this.entrySet = new EntrySet()) : this.entrySet;
-    }
+    private void removeFromFrequencyBucket(int slot) {
+        FrequencyList.Node node = slotToNode.remove(slot);
+        if (node == null) return;
 
-    private void updateFrequency(Node<K, V> node) {
-        removeFromFrequencyBucket(node);
-        node.frequency++;
-        addToFrequencyBucket(node);
-    }
-
-    private void addToFrequencyBucket(Node<K, V> node) {
-        frequencyBuckets.computeIfAbsent(node.frequency, k -> new DoublyLinkedList<>()).addNode(node);
-    }
-
-    private void removeFromFrequencyBucket(Node<K, V> node) {
-        DoublyLinkedList<K, V> list = frequencyBuckets.get(node.frequency);
-        if (list != null) {
+        // Find which bucket this node belongs to by scanning, O(log n) at most
+        // since we only have as many buckets as distinct frequencies
+        for (Map.Entry<Integer, FrequencyList> entry : frequencyBuckets.entrySet()) {
+            FrequencyList list = entry.getValue();
+            // Check if this node is actually in this list by walking from it
+            // (safe because node.prev/next are nulled on removeNode)
             list.removeNode(node);
-            if (list.isEmpty()) frequencyBuckets.remove(node.frequency);
+            if (list.isEmpty()) {
+                frequencyBuckets.remove(entry.getKey());
+            }
+            break; // node can only belong to one bucket
         }
     }
 
+    @SuppressWarnings("unchecked")
     private void evictLFRU() {
         if (frequencyBuckets.isEmpty()) return;
-        int lowestFrequency = frequencyBuckets.firstKey();
-        DoublyLinkedList<K, V> list = frequencyBuckets.get(lowestFrequency);
-        if (list != null) {
-            Node<K, V> nodeToEvict = list.removeHead();
-            if (nodeToEvict != null) {
-                cache.remove(nodeToEvict.key);
-                if (list.isEmpty()) frequencyBuckets.remove(lowestFrequency);
-            }
+
+        int lowestFreq = frequencyBuckets.firstKey();
+        FrequencyList list = frequencyBuckets.get(lowestFreq);
+        if (list == null) return;
+
+        int evictSlot = list.removeHead();
+        if (list.isEmpty()) frequencyBuckets.remove(lowestFreq);
+
+        if (evictSlot >= 0) {
+            slotToNode.remove(evictSlot);
+            keys[evictSlot]   = TOMBSTONE;
+            values[evictSlot] = EMPTY;
+            hashes[evictSlot] = 0;
+            size--;
         }
     }
 
-    public int size() {
-        return cache.size();
+    private int findSlot(Object key) {
+        int hash     = key.hashCode();
+        int tableLen = keys.length;
+        int slot     = indexFor(hash, tableLen);
+
+        for (int i = 0; i < tableLen; i++) {
+            Object k = keys[slot];
+            if (k == EMPTY)     return -1;
+            if (k != TOMBSTONE && hashes[slot] == hash && k.equals(key)) return slot;
+            slot = (slot + 1) & (tableLen - 1);
+        }
+        return -1;
     }
 
-    @Override
-    public boolean isEmpty() {
-        return cache.isEmpty();
+    /** Inserts a new key-value pair and returns the slot it landed in. */
+    private int insertNew(K key, V value) {
+        int hash     = key.hashCode();
+        int tableLen = keys.length;
+        int slot     = indexFor(hash, tableLen);
+
+        while (keys[slot] != EMPTY && keys[slot] != TOMBSTONE) {
+            slot = (slot + 1) & (tableLen - 1);
+        }
+
+        keys[slot]   = key;
+        values[slot] = value;
+        hashes[slot] = hash;
+        size++;
+        return slot;
     }
 
-    @Override
-    public boolean containsValue(final Object o) {
-        return cache.containsValue(o);
+    private boolean isOccupied(int slot) {
+        return keys[slot] != EMPTY && keys[slot] != TOMBSTONE;
     }
 
-    public boolean containsKey(Object key) {
-        return cache.containsKey(key);
+    private static int indexFor(int hash, int tableLen) {
+        return (hash ^ (hash >>> 16)) & (tableLen - 1);
     }
 
-    private class Values implements Collection<V> {
-        @Override
-        public int size() {
-            return LFRUCache.this.cache.size();
-        }
-
-        @Override
-        public boolean contains(Object o) {
-            return LFRUCache.this.cache.containsValue(o);
-        }
-
-        @Override
-        public boolean containsAll(Collection<?> c) {
-            for (Object o : c) {
-                if (!(o instanceof Map.Entry<?, ?> entry)) {
-                    return false;
-                }
-                if (!LFRUCache.this.cache.containsValue(entry.getValue())) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        @Override
-        public boolean addAll(final Collection<? extends V> collection) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean removeAll(final Collection<?> collection) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean retainAll(final Collection<?> collection) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public void clear() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return LFRUCache.this.cache.isEmpty();
-        }
-
-        @Override
-        public Iterator<V> iterator() {
-            return new ValuesIterator();
-        }
-
-        @Override
-        public Object[] toArray() {
-            return LFRUCache.this.cache.values().toArray();
-        }
-
-        @Override
-        public <T> T[] toArray(T[] a) {
-            return LFRUCache.this.cache.values().toArray(a);
-        }
-
-        @Override
-        public boolean add(final V v) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean remove(final Object o) {
-            throw new UnsupportedOperationException();
-        }
+    private static int nextPowerOfTwo(int n) {
+        if (n <= 1) return 1;
+        int p = 1;
+        while (p < n) p <<= 1;
+        return p;
     }
 
-    private class ValuesIterator implements Iterator<V> {
-        private final Iterator<Map.Entry<K, V>> iterator = LFRUCache.this.cache.values().iterator();
+    private abstract class TableIterator<T> implements Iterator<T> {
+        int cursor      = -1;
+        int lastReturned = -1;
 
-        @Override
-        public boolean hasNext() {
-            return iterator.hasNext();
+        TableIterator() { advance(); }
+
+        private void advance() {
+            cursor = lastReturned + 1;
+            while (cursor < keys.length && !isOccupied(cursor)) cursor++;
         }
 
-        @Override
-        public V next() {
-            return iterator.next().getValue();
+        @Override public boolean hasNext() { return cursor < keys.length; }
+
+        int nextSlot() {
+            if (!hasNext()) throw new NoSuchElementException();
+            lastReturned = cursor;
+            advance();
+            return lastReturned;
         }
 
         @Override
         public void remove() {
-            iterator.remove();
+            if (lastReturned < 0) throw new IllegalStateException();
+            removeFromFrequencyBucket(lastReturned);
+            keys[lastReturned]   = TOMBSTONE;
+            values[lastReturned] = EMPTY;
+            hashes[lastReturned] = 0;
+            slotToNode.remove(lastReturned);
+            size--;
+            lastReturned = -1;
         }
     }
 
-    private class EntrySet implements Set<Entry<K, V>> {
-        @Override
-        public int size() {
-            return LFRUCache.this.cache.size();
+    private class KeySet extends AbstractSet<K> {
+        @Override public int size() { return size; }
+        @Override public boolean contains(Object o) { return findSlot(o) >= 0; }
+        @Override public Iterator<K> iterator() {
+            return new TableIterator<K>() {
+                @Override @SuppressWarnings("unchecked")
+                public K next() { return (K) keys[nextSlot()]; }
+            };
         }
+    }
 
-        @Override
-        public boolean contains(Object o) {
-            return LFRUCache.this.cache.containsValue(((Map.Entry<K, V>) o).getValue());
+    private class Values extends AbstractCollection<V> {
+        @Override public int size() { return size; }
+        @Override public Iterator<V> iterator() {
+            return new TableIterator<V>() {
+                @Override @SuppressWarnings("unchecked")
+                public V next() { return (V) values[nextSlot()]; }
+            };
         }
+    }
 
-        @Override
-        public boolean containsAll(Collection<?> c) {
-            return LFRUCache.this.cache.containsValue(c);
-        }
-
-        @Override
-        public boolean addAll(final Collection<? extends Entry<K, V>> collection) {
-            boolean modified = false;
-            for (Entry<K, V> entry : collection) {
-                modified |= LFRUCache.this.put(entry.getKey(), entry.getValue()) == null;
-            }
-            return modified;
-        }
-
-        @Override
-        public boolean retainAll(final Collection<?> collection) {
-            boolean modified = false;
-            for (Object o : collection) {
-                if (!(o instanceof Map.Entry<?, ?> entry)) {
-                    continue;
+    private class EntrySet extends AbstractSet<Entry<K, V>> {
+        @Override public int size() { return size; }
+        @Override public Iterator<Entry<K, V>> iterator() {
+            return new TableIterator<Entry<K, V>>() {
+                @Override @SuppressWarnings("unchecked")
+                public Entry<K, V> next() {
+                    int slot = nextSlot();
+                    return new AbstractMap.SimpleEntry<>((K) keys[slot], (V) values[slot]);
                 }
-                if (collection.contains(LFRUCache.this.get(entry.getKey()))) {
-                    continue;
-                }
-                modified |= LFRUCache.this.remove(entry.getKey()) != null;
-            }
-            return modified;
+            };
         }
-
-        @Override
-        public boolean removeAll(final Collection<?> collection) {
-            boolean modified = false;
-            for (Object o : collection) {
-                if (!(o instanceof Map.Entry<?, ?> entry)) {
-                    continue;
-                }
-                modified |= LFRUCache.this.remove(entry.getKey()) != null;
-            }
-            return modified;
-        }
-
-        @Override
-        public void clear() {
-            LFRUCache.this.clear();
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return LFRUCache.this.cache.isEmpty();
-        }
-
-        @Override
-        public Iterator<Entry<K, V>> iterator() {
-            return LFRUCache.this.cache.values().iterator();
-        }
-
-        @Override
-        public Object[] toArray() {
-            return LFRUCache.this.cache.values().toArray();
-        }
-
-        @Override
-        public <T> T[] toArray(final T[] ts) {
-            return LFRUCache.this.cache.values().toArray(ts);
-        }
-
-        @Override
-        public boolean add(final Entry<K, V> kvEntry) {
-            return LFRUCache.this.put(kvEntry.getKey(), kvEntry.getValue()) == null;
-        }
-
-        @Override
-        public boolean remove(final Object o) {
-            Map.Entry<K, V> entry = (Map.Entry<K, V>) o;
-            return LFRUCache.this.remove(entry.getKey()) != null;
+        @Override public boolean contains(Object o) {
+            if (!(o instanceof Entry<?, ?> e)) return false;
+            int slot = findSlot(e.getKey());
+            return slot >= 0 && values[slot].equals(e.getValue());
         }
     }
 }

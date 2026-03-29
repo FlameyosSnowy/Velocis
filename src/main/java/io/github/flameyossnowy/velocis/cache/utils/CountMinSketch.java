@@ -1,5 +1,7 @@
 package io.github.flameyossnowy.velocis.cache.utils;
 
+import org.jetbrains.annotations.Contract;
+
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -27,6 +29,7 @@ public class CountMinSketch<K> {
         }
     }
 
+    @Contract(pure = true)
     public int getFrequency(K key) {
         int hash = key.hashCode();
         int min = Integer.MAX_VALUE;
