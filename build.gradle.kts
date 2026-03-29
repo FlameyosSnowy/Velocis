@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "io.github.flameyossnowy"
-version = "1.1.2"
+version = "1.2.0"
 
 java {
     toolchain {
