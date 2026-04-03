@@ -1,361 +1,310 @@
 package io.github.flameyossnowy.velocis.cache.algorithms;
 
+import org.jetbrains.annotations.Nullable;
+
 import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.StampedLock;
 
-@SuppressWarnings({"unchecked", })
+/**
+ * Low-level, parallel-array, open-addressing LFRU (Least Frequently Recently Used) cache.
+ *
+ * <h2>Layout</h2>
+ * Five flat arrays indexed by the same slot index {@code i}:
+ * <pre>
+ *   int[]    hashes    — spread hash; 0 = empty, -1 = tombstone
+ *   Object[] keys      — key at slot i
+ *   Object[] values    — value at slot i
+ *   int[]    freqs     — access frequency at slot i
+ *   long[]   lastUsed  — logical timestamp of last access (for recency tiebreaking)
+ * </pre>
+ *
+ * <h2>LFRU policy</h2>
+ * On eviction, the candidate with the <em>lowest frequency</em> is chosen.
+ * Among equal-frequency candidates the <em>least recently used</em> wins,
+ * i.e. the one with the smallest {@code lastUsed} timestamp.
+ * This combines LFU correctness with LRU tiebreaking, avoiding the
+ * "cache pollution" problem of pure LFU where a one-time burst can keep
+ * a stale entry alive forever.
+ *
+ * <h2>Concurrency</h2>
+ * {@link StampedLock} with optimistic reads, same model as
+ * {@link ConcurrentLFUCache}.
+ */
+@SuppressWarnings("unchecked")
 public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
+
+    private static final int   EMPTY     =  0;
+    private static final int   TOMBSTONE = -1;
+    private static final float LOAD      = 0.70f;
+
+    private int[]    hashes;
+    private Object[] keys;
+    private Object[] values;
+    private int[]    freqs;
+    private long[]   lastUsed;
+
+    private int capacity;
+    private int mask;
     private final int maxSize;
-    private final ConcurrentHashMap<K, Map.Entry<K, V>> cache;
-    private final ConcurrentHashMap<K, Integer> frequencyMap;
-    private final AtomicReference<Node<K, V>> head;
-    private final AtomicReference<Node<K, V>> tail;
 
-    private Values values;
-    private EntrySet entrySet;
-
-    private static final int INITIAL_CAPACITY = 16;
-    private static final int INITIAL_CONCURRENCY_LEVEL = 1;
-    private static final float INITIAL_LOAD_FACTOR =  0.75F;
-
-    public ConcurrentLFRUCache(int maxSize, int concurrencyLevel, float loadFactor) {
-        if (maxSize <= 0) throw new IllegalArgumentException("Cache size must be greater than 0");
-        this.maxSize = maxSize;
-        this.cache = new ConcurrentHashMap<>(concurrencyLevel, loadFactor);
-        this.frequencyMap = new ConcurrentHashMap<>(concurrencyLevel, loadFactor);
-        this.head = new AtomicReference<>(null);
-        this.tail = new AtomicReference<>(null);
-    }
-
-    public ConcurrentLFRUCache(int maxSize, int concurrencyLevel) {
-        this(maxSize, concurrencyLevel, INITIAL_LOAD_FACTOR);
-    }
-
-    public ConcurrentLFRUCache(int maxSize, float loadFactor) {
-        this(maxSize, INITIAL_CONCURRENCY_LEVEL, loadFactor);
-    }
+    private final StampedLock   lock      = new StampedLock();
+    private final AtomicInteger liveCount = new AtomicInteger(0);
+    private long                clock     = 0L;
 
     public ConcurrentLFRUCache(int maxSize) {
-        if (maxSize <= 0) throw new IllegalArgumentException("Cache size must be greater than 0");
-        this.maxSize = maxSize;
-        this.cache = new ConcurrentHashMap<>();
-        this.frequencyMap = new ConcurrentHashMap<>();
-        this.head = new AtomicReference<>(null);
-        this.tail = new AtomicReference<>(null);
+        if (maxSize <= 0) throw new IllegalArgumentException("maxSize must be > 0");
+        this.maxSize  = maxSize;
+        this.capacity = nextPow2((int) (maxSize / LOAD) + 1);
+        this.mask     = capacity - 1;
+        allocArrays(capacity);
     }
 
-    public ConcurrentLFRUCache() {
-        this(INITIAL_CAPACITY, INITIAL_CONCURRENCY_LEVEL, INITIAL_LOAD_FACTOR);
+    public ConcurrentLFRUCache()                               { this(16); }
+    public ConcurrentLFRUCache(int s, int i)                   { this(s); }
+    public ConcurrentLFRUCache(int s, float f)                 { this(s); }
+    public ConcurrentLFRUCache(int s, int i, float f)          { this(s); }
+
+    private void allocArrays(int cap) {
+        hashes   = new int   [cap];
+        keys     = new Object[cap];
+        values   = new Object[cap];
+        freqs    = new int   [cap];
+        lastUsed = new long  [cap];
     }
 
-    @Override
-    public int size() {
-        return cache.size();
-    }
-
-    @Override
-    public boolean isEmpty() {
-        return cache.isEmpty();
-    }
-
-    @Override
-    public boolean containsKey(final Object o) {
-        return cache.containsKey(o);
-    }
-
-    @Override
-    public boolean containsValue(final Object o) {
-        return cache.containsValue(o);
+    private static int spread(int h) {
+        h ^= (h >>> 16);
+        h &= 0x7FFF_FFFF;
+        return h == 0 ? 1 : h;
     }
 
     @Override
-    public V get(Object key) {
-        Node<K, V> node = (Node<K, V>) cache.get(key);
-        if (node == null) return null;
-        incrementFrequency(node);
-        moveToTail(node);
-        return node.value;
-    }
+    public @Nullable V get(Object key) {
+        int h = spread(key.hashCode());
 
-    @Override
-    public V put(K key, V value) {
-        Node<K, V> newNode = new Node<>(key, value);
-        Node<K, V> existingNode = (Node<K, V>) cache.putIfAbsent(key, newNode);
-        if (existingNode != null) {
-            existingNode.value = value;
-            incrementFrequency(existingNode);
-            moveToTail(existingNode);
-            return existingNode.value;
+        // Optimistic read
+        long stamp = lock.tryOptimisticRead();
+        int  idx   = findSlot(h, key, hashes, keys, mask);
+        V    val   = idx >= 0 ? (V) values[idx] : null;
+
+        if (!lock.validate(stamp)) {
+            stamp = lock.readLock();
+            try {
+                idx = findSlot(h, key, hashes, keys, mask);
+                val = idx >= 0 ? (V) values[idx] : null;
+            } finally {
+                lock.unlockRead(stamp);
+            }
         }
-        addNodeToTail(newNode);
-        if (cache.size() > maxSize) evictLFRU();
-        return null;
-    }
 
-    @Override
-    public V remove(Object key) {
-        Node<K, V> node = (Node<K, V>) cache.remove(key);
-        if (node != null) {
-            removeNode(node);
-            frequencyMap.remove(key);
-            return node.value;
+        if (idx >= 0) {
+            long ws = lock.writeLock();
+            try {
+                int widx = findSlot(h, key, hashes, keys, mask);
+                if (widx >= 0) {
+                    freqs   [widx]++;
+                    lastUsed[widx] = ++clock;
+                }
+            } finally {
+                lock.unlockWrite(ws);
+            }
         }
-        return null;
+
+        return val;
     }
 
     @Override
-    public void putAll(final Map<? extends K, ? extends V> map) {
-        for (Entry<? extends K, ? extends V> entry : map.entrySet()) {
-            this.put(entry.getKey(), entry.getValue());
+    public @Nullable V put(K key, V value) {
+        int h = spread(key.hashCode());
+
+        long stamp = lock.writeLock();
+        try {
+            int idx = findSlot(h, key, hashes, keys, mask);
+            if (idx >= 0) {
+                V old       = (V) values[idx];
+                values  [idx] = value;
+                freqs   [idx]++;
+                lastUsed[idx] = ++clock;
+                return old;
+            }
+
+            if (liveCount.get() >= maxSize) evictLFRU();
+
+            int slot = probeInsert(h, hashes, mask);
+            hashes  [slot] = h;
+            keys    [slot] = key;
+            values  [slot] = value;
+            freqs   [slot] = 1;
+            lastUsed[slot] = ++clock;
+            liveCount.incrementAndGet();
+            return null;
+        } finally {
+            lock.unlockWrite(stamp);
         }
     }
 
     @Override
-    public void clear() {
-        cache.clear();
-        frequencyMap.clear();
-        head.set(null);
-        tail.set(null);
-    }
-
-    @Override
-    public Set<K> keySet() {
-        return cache.keySet();
-    }
-
-    @Override
-    public Collection<V> values() {
-        return (values == null) ? (values = new Values()) : values;
-    }
-
-    @Override
-    public Set<Entry<K, V>> entrySet() {
-        return (entrySet == null) ? (entrySet = new EntrySet()) : entrySet;
-    }
-
-    private void incrementFrequency(Node<K, V> node) {
-        frequencyMap.merge(node.key, 1, Integer::sum);
-        node.frequency = frequencyMap.get(node.key);
-    }
-
-    private void moveToTail(Node<K, V> node) {
-        if (tail.get() == node) return;
-        removeNode(node);
-        addNodeToTail(node);
-    }
-
-    private void addNodeToTail(Node<K, V> node) {
-        Node<K, V> oldTail;
-        do {
-            oldTail = tail.get();
-            node.prev = oldTail;
-        } while (!tail.compareAndSet(oldTail, node));
-        if (oldTail != null) oldTail.next = node;
-        else head.set(node);
-    }
-
-    private void removeNode(Node<K, V> node) {
-        Node<K, V> prev = node.prev;
-        Node<K, V> next = node.next;
-        if (prev != null) prev.next = next;
-        else head.set(next);
-        if (next != null) next.prev = prev;
-        else tail.set(prev);
+    public @Nullable V remove(Object key) {
+        int h = spread(key.hashCode());
+        long stamp = lock.writeLock();
+        try {
+            int idx = findSlot(h, key, hashes, keys, mask);
+            if (idx < 0) return null;
+            V old        = (V) values[idx];
+            hashes  [idx] = TOMBSTONE;
+            keys    [idx] = null;
+            values  [idx] = null;
+            freqs   [idx] = 0;
+            lastUsed[idx] = 0L;
+            liveCount.decrementAndGet();
+            return old;
+        } finally {
+            lock.unlockWrite(stamp);
+        }
     }
 
     private void evictLFRU() {
-        Node<K, V> leastUsed = head.get();
-        Node<K, V> current = head.get();
-        while (current != null) {
-            if (current.frequency < leastUsed.frequency) {
-                leastUsed = current;
+        int  minFreq     = Integer.MAX_VALUE;
+        long minLastUsed = Long.MAX_VALUE;
+        int  victim      = -1;
+
+        int[]    hs = hashes;
+        int[]    fs = freqs;
+        long[]   lu = lastUsed;
+        int      cap = capacity;
+
+        for (int i = 0; i < cap; i++) {
+            if (hs[i] <= 0) continue; // empty or tombstone
+            int  f = fs[i];
+            long t = lu[i];
+            if (f < minFreq || (f == minFreq && t < minLastUsed)) {
+                minFreq     = f;
+                minLastUsed = t;
+                victim      = i;
             }
-            current = current.next;
-        }
-        if (leastUsed != null) remove(leastUsed.key);
-    }
-
-    private class Values implements Collection<V> {
-        @Override
-        public int size() {
-            return ConcurrentLFRUCache.this.cache.size();
         }
 
-        @Override
-        public boolean contains(Object o) {
-            return ConcurrentLFRUCache.this.cache.containsValue(o);
-        }
-
-        @Override
-        public boolean containsAll(Collection<?> c) {
-            return ConcurrentLFRUCache.this.cache.containsValue(c);
-        }
-
-        @Override
-        public boolean addAll(final Collection<? extends V> collection) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean removeAll(final Collection<?> collection) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean retainAll(final Collection<?> collection) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public void clear() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return ConcurrentLFRUCache.this.cache.isEmpty();
-        }
-
-        @Override
-        public Iterator<V> iterator() {
-            return new ValuesIterator();
-        }
-
-        @Override
-        public Object[] toArray() {
-            return ConcurrentLFRUCache.this.cache.values().toArray();
-        }
-
-        @Override
-        public <T> T[] toArray(T[] a) {
-            return ConcurrentLFRUCache.this.cache.values().toArray(a);
-        }
-
-        @Override
-        public boolean add(final V v) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean remove(final Object o) {
-            throw new UnsupportedOperationException();
+        if (victim >= 0) {
+            hashes  [victim] = TOMBSTONE;
+            keys    [victim] = null;
+            values  [victim] = null;
+            freqs   [victim] = 0;
+            lastUsed[victim] = 0L;
+            liveCount.decrementAndGet();
         }
     }
 
-    private class ValuesIterator implements Iterator<V> {
-        private final Iterator<Map.Entry<K, V>> iterator = ConcurrentLFRUCache.this.cache.values().iterator();
-
-        @Override
-        public boolean hasNext() {
-            return iterator.hasNext();
+    private static int findSlot(int h, Object key, int[] hs, Object[] ks, int mask) {
+        int i = h & mask;
+        for (int p = 0; p <= mask; p++) {
+            int sh = hs[i];
+            if (sh == EMPTY)                        return -1;
+            if (sh == h && key.equals(ks[i]))       return i;
+            i = (i + 1) & mask;
         }
+        return -1;
+    }
 
-        @Override
-        public V next() {
-            return iterator.next().getValue();
+    private static int probeInsert(int h, int[] hs, int mask) {
+        return probe0(h, hs, mask, EMPTY, TOMBSTONE);
+    }
+
+    static int probe0(int h, int[] hs, int mask, int empty, int tombstone) {
+        int i         = h & mask;
+        int firstTomb = -1;
+        for (int p = 0; p <= mask; p++) {
+            int sh = hs[i];
+            if (sh == empty)                          return firstTomb >= 0 ? firstTomb : i;
+            if (sh == tombstone && firstTomb < 0)     firstTomb = i;
+            i = (i + 1) & mask;
         }
+        return firstTomb;
+    }
 
-        @Override
-        public void remove() {
-            iterator.remove();
+    @Override public void putAll(Map<? extends K, ? extends V> m) { m.forEach(this::put); }
+
+    @Override
+    public void clear() {
+        long stamp = lock.writeLock();
+        try {
+            Arrays.fill(hashes,   EMPTY);
+            Arrays.fill(keys,     null);
+            Arrays.fill(values,   null);
+            Arrays.fill(freqs,    0);
+            Arrays.fill(lastUsed, 0L);
+            liveCount.set(0);
+            clock = 0L;
+        } finally {
+            lock.unlockWrite(stamp);
         }
     }
 
-    private class EntrySet implements Set<Entry<K, V>> {
-        @Override
-        public int size() {
-            return ConcurrentLFRUCache.this.cache.size();
-        }
+    @Override public int     size()                   { return liveCount.get(); }
+    @Override public boolean isEmpty()                { return liveCount.get() == 0; }
+    @Override public boolean containsKey(Object key) { return get(key) != null; }
+    @Override public boolean containsValue(Object v) {
+        long stamp = lock.readLock();
+        try {
+            for (int i = 0; i < capacity; i++)
+                if (hashes[i] > 0 && v.equals(values[i])) return true;
+            return false;
+        } finally { lock.unlockRead(stamp); }
+    }
 
-        @Override
-        public boolean contains(Object o) {
-            return ConcurrentLFRUCache.this.cache.containsValue(((Map.Entry<K, V>) o).getValue());
-        }
+    @Override public Set<K>          keySet()   { return new KeySetView(); }
+    @Override public Collection<V>   values()   { return new ValuesView(); }
+    @Override public Set<Entry<K,V>> entrySet() { return new EntrySetView(); }
 
-        @Override
-        public boolean containsAll(Collection<?> c) {
-            for (Object o : c) {
-                if (!(o instanceof Map.Entry<?, ?> entry)) {
-                    return false;
-                }
-                if (!ConcurrentLFRUCache.this.cache.containsValue(entry.getValue())) {
-                    return false;
-                }
-            }
-            return true;
+    private abstract class SlotIterator<T> implements Iterator<T> {
+        int cursor = 0;
+        int next   = -1;
+        SlotIterator() { advance(); }
+        private void advance() {
+            while (cursor < capacity && hashes[cursor] <= 0) cursor++;
+            next = cursor < capacity ? cursor++ : -1;
         }
+        @Override public boolean hasNext() { return next >= 0; }
+        @Override public T next() {
+            if (next < 0) throw new NoSuchElementException();
+            int i = next; advance(); return extract(i);
+        }
+        abstract T extract(int i);
+    }
 
-        @Override
-        public boolean addAll(final Collection<? extends Entry<K, V>> collection) {
-            boolean modified = false;
-            for (Entry<K, V> entry : collection) {
-                modified |= ConcurrentLFRUCache.this.put(entry.getKey(), entry.getValue()) == null;
-            }
-            return modified;
+    private final class KeySetView extends AbstractSet<K> {
+        @Override public int size() { return liveCount.get(); }
+        @Override public boolean contains(Object o) { return containsKey(o); }
+        @Override public Iterator<K> iterator() {
+            long s = lock.readLock(); try {
+                return new SlotIterator<K>() { @Override K extract(int i) { return (K) keys[i]; } };
+            } finally { lock.unlockRead(s); }
         }
+    }
 
-        @Override
-        public boolean retainAll(final Collection<?> collection) {
-            boolean modified = false;
-            for (Object o : collection) {
-                if (!(o instanceof Map.Entry<?, ?> entry)) {
-                    continue;
-                }
-                if (collection.contains(ConcurrentLFRUCache.this.get(entry.getKey()))) {
-                    continue;
-                }
-                modified |= ConcurrentLFRUCache.this.remove(entry.getKey()) != null;
-            }
-            return modified;
+    private final class ValuesView extends AbstractCollection<V> {
+        @Override public int size() { return liveCount.get(); }
+        @Override public Iterator<V> iterator() {
+            long s = lock.readLock(); try {
+                return new SlotIterator<V>() { @Override V extract(int i) { return (V) values[i]; } };
+            } finally { lock.unlockRead(s); }
         }
+    }
 
-        @Override
-        public boolean removeAll(final Collection<?> collection) {
-            boolean modified = false;
-            for (Object o : collection) {
-                if (!(o instanceof Map.Entry<?, ?> entry)) {
-                    continue;
-                }
-                modified |= ConcurrentLFRUCache.this.remove(entry.getKey()) != null;
-            }
-            return modified;
+    private final class EntrySetView extends AbstractSet<Entry<K,V>> {
+        @Override public int size() { return liveCount.get(); }
+        @Override public Iterator<Entry<K,V>> iterator() {
+            long s = lock.readLock(); try {
+                return new SlotIterator<Entry<K,V>>() {
+                    @Override Entry<K,V> extract(int i) { return Map.entry((K) keys[i], (V) values[i]); }
+                };
+            } finally { lock.unlockRead(s); }
         }
+    }
 
-        @Override
-        public void clear() {
-            ConcurrentLFRUCache.this.clear();
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return ConcurrentLFRUCache.this.cache.isEmpty();
-        }
-
-        @Override
-        public Iterator<Entry<K, V>> iterator() {
-            return ConcurrentLFRUCache.this.cache.values().iterator();
-        }
-
-        @Override
-        public Object[] toArray() {
-            return ConcurrentLFRUCache.this.cache.values().toArray();
-        }
-
-        @Override
-        public <T> T[] toArray(final T[] ts) {
-            return ConcurrentLFRUCache.this.cache.values().toArray(ts);
-        }
-
-        @Override
-        public boolean add(final Entry<K, V> kvEntry) {
-            return ConcurrentLFRUCache.this.put(kvEntry.getKey(), kvEntry.getValue()) == null;
-        }
-
-        @Override
-        public boolean remove(final Object o) {
-            Map.Entry<K, V> entry = (Map.Entry<K, V>) o;
-            return ConcurrentLFRUCache.this.remove(entry.getKey()) != null;
-        }
+    static int nextPow2(int n) {
+        if (n <= 1) return 2;
+        n--; n |= n>>>1; n |= n>>>2; n |= n>>>4; n |= n>>>8; n |= n>>>16;
+        return n + 1;
     }
 }
