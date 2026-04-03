@@ -1,6 +1,7 @@
 package io.github.flameyossnowy.velocis.tables;
 
-import java.lang.reflect.Array;
+import org.jetbrains.annotations.NotNull;
+
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -168,12 +169,7 @@ public class ConcurrentHashTable<R, C, V> implements Table<R, C, V> {
     ) {
         // Collect nodes before target, then re-prepend them after the updated node
         // to preserve chain order.
-        Deque<Node<R, C, V>> before = new ArrayDeque<>();
-        Node<R, C, V> cur = head;
-        while (cur != target) {
-            before.push(cur);
-            cur = cur.next;
-        }
+        Deque<Node<R, C, V>> before = rebuild(head, target);
         Node<R, C, V> rebuilt = new Node<>(row, column, newValue, hash, target.next);
         // Re-prepend nodes that came before target
         while (!before.isEmpty()) {
@@ -181,6 +177,16 @@ public class ConcurrentHashTable<R, C, V> implements Table<R, C, V> {
             rebuilt = new Node<>(n.row, n.column, n.value, n.hash, rebuilt);
         }
         return rebuilt;
+    }
+
+    private Deque<Node<R, C, V>> rebuild(Node<R, C, V> head, Node<R, C, V> target) {
+        Deque<Node<R, C, V>> before = new ArrayDeque<>();
+        Node<R, C, V> cur = head;
+        while (cur != target) {
+            before.push(cur);
+            cur = cur.next;
+        }
+        return before;
     }
 
     /**
@@ -224,12 +230,7 @@ public class ConcurrentHashTable<R, C, V> implements Table<R, C, V> {
 
     /** Rebuilds the chain omitting {@code target}. */
     private Node<R, C, V> rebuildWithout(Node<R, C, V> head, Node<R, C, V> target) {
-        Deque<Node<R, C, V>> before = new ArrayDeque<>();
-        Node<R, C, V> cur = head;
-        while (cur != target) {
-            before.push(cur);
-            cur = cur.next;
-        }
+        Deque<Node<R, C, V>> before = rebuild(head, target);
         Node<R, C, V> rebuilt = target.next; // skip target
         while (!before.isEmpty()) {
             Node<R, C, V> n = before.pop();
@@ -424,7 +425,7 @@ public class ConcurrentHashTable<R, C, V> implements Table<R, C, V> {
             return ConcurrentHashTable.this.remove((R) e.row(), (C) e.column()) != null;
         }
         @Override public void clear() { ConcurrentHashTable.this.clear(); }
-        @Override public Iterator<Table.Entry<R, C, V>> iterator() {
+        @Override public @NotNull Iterator<Table.Entry<R, C, V>> iterator() {
             return new TableIterator<Table.Entry<R, C, V>>() {
                 @Override public Table.Entry<R, C, V> next() { return nextNode(); }
             };
@@ -442,7 +443,7 @@ public class ConcurrentHashTable<R, C, V> implements Table<R, C, V> {
             return ConcurrentHashTable.this.remove((R) e.row(), (C) e.column()) != null;
         }
         @Override public void clear() { ConcurrentHashTable.this.clear(); }
-        @Override public Iterator<Table.KeyEntry<R, C>> iterator() {
+        @Override public @NotNull Iterator<Table.KeyEntry<R, C>> iterator() {
             return new TableIterator<Table.KeyEntry<R, C>>() {
                 @Override public Table.KeyEntry<R, C> next() { return nextNode().key(); }
             };
@@ -452,7 +453,7 @@ public class ConcurrentHashTable<R, C, V> implements Table<R, C, V> {
     private class Values extends AbstractCollection<V> {
         @Override public int size() { return ConcurrentHashTable.this.size(); }
         @Override public boolean contains(Object o) { return ConcurrentHashTable.this.containsValue((V) o); }
-        @Override public Iterator<V> iterator() {
+        @Override public @NotNull Iterator<V> iterator() {
             return new TableIterator<V>() {
                 @Override public V next() { return nextNode().value; }
             };
@@ -464,14 +465,57 @@ public class ConcurrentHashTable<R, C, V> implements Table<R, C, V> {
 
         RowMap(R row) { this.row = row; }
 
-        @Override public int     size()             { return ConcurrentHashTable.this.size(); }
-        @Override public boolean isEmpty()           { return ConcurrentHashTable.this.isEmpty(); }
+        @Override
+        public int size() {
+            int count = 0;
+            AtomicReferenceArray<Node<R, C, V>> table = tableRef.get();
+            for (int i = 0; i < table.length(); i++) {
+                Node<R, C, V> node = table.get(i);
+                while (node != null) {
+                    if (Objects.equals(node.row, row)) count++;
+                    node = node.next;
+                }
+            }
+            return count;
+        }
+
+        @Override
+        public boolean isEmpty() {
+            AtomicReferenceArray<Node<R, C, V>> table = tableRef.get();
+            for (int i = 0; i < table.length(); i++) {
+                Node<R, C, V> node = table.get(i);
+                while (node != null) {
+                    if (Objects.equals(node.row, row)) return false;
+                    node = node.next;
+                }
+            }
+            return true;
+        }
+
         @Override public boolean containsKey(Object c) { return ConcurrentHashTable.this.containsKey(row, (C) c); }
         @Override public boolean containsValue(Object v) { return ConcurrentHashTable.this.containsValue((V) v); }
         @Override public V       get(Object c)       { return ConcurrentHashTable.this.get(row, (C) c); }
         @Override public V       put(C c, V v)       { return ConcurrentHashTable.this.put(row, c, v); }
         @Override public V       remove(Object c)    { return ConcurrentHashTable.this.remove(row, (C) c); }
-        @Override public void    clear()             { ConcurrentHashTable.this.clear(); }
+
+        @Override
+        public void clear() {
+            AtomicReferenceArray<Node<R, C, V>> table = tableRef.get();
+            for (int i = 0; i < table.length(); i++) {
+                Node<R, C, V> head = table.get(i);
+                Node<R, C, V> filtered = null;
+                Node<R, C, V> cur = head;
+                while (cur != null) {
+                    if (!Objects.equals(cur.row, row)) {
+                        filtered = new Node<>(cur.row, cur.column, cur.value, cur.hash, filtered);
+                    } else {
+                        size.decrement();
+                    }
+                    cur = cur.next;
+                }
+                table.set(i, filtered);
+            }
+        }
 
         @Override
         public void putAll(Map<? extends C, ? extends V> map) {
@@ -479,9 +523,9 @@ public class ConcurrentHashTable<R, C, V> implements Table<R, C, V> {
                 ConcurrentHashTable.this.put(row, e.getKey(), e.getValue());
         }
 
-        @Override public Set<C>              keySet()   { return new RowMapKeySet(row); }
-        @Override public Collection<V>       values()   { return new RowMapValues(row); }
-        @Override public Set<Map.Entry<C,V>> entrySet() { return new RowMapEntries(row); }
+        @Override public @NotNull Set<C>              keySet()   { return new RowMapKeySet(row); }
+        @Override public @NotNull Collection<V>       values()   { return new RowMapValues(row); }
+        @Override public @NotNull Set<Map.Entry<C,V>> entrySet() { return new RowMapEntries(row); }
     }
 
     private abstract class RowTableIterator<T> implements Iterator<T> {
@@ -540,7 +584,7 @@ public class ConcurrentHashTable<R, C, V> implements Table<R, C, V> {
             if (!(o instanceof Map.Entry<?,?> e)) return false;
             return ConcurrentHashTable.this.remove(row, (C) e.getKey()) != null;
         }
-        @Override public Iterator<Map.Entry<C, V>> iterator() {
+        @Override public @NotNull Iterator<Map.Entry<C, V>> iterator() {
             return new RowTableIterator<Map.Entry<C, V>>(row) {
                 @Override public Map.Entry<C, V> next() {
                     Node<R, C, V> n = nextNode();
@@ -556,7 +600,7 @@ public class ConcurrentHashTable<R, C, V> implements Table<R, C, V> {
         @Override public int size() { return ConcurrentHashTable.this.size(); }
         @Override public boolean contains(Object o) { return ConcurrentHashTable.this.containsKey(row, (C) o); }
         @Override public boolean remove(Object o)   { return ConcurrentHashTable.this.remove(row, (C) o) != null; }
-        @Override public Iterator<C> iterator() {
+        @Override public @NotNull Iterator<C> iterator() {
             return new RowTableIterator<C>(row) {
                 @Override public C next() { return nextNode().column; }
             };
@@ -568,7 +612,7 @@ public class ConcurrentHashTable<R, C, V> implements Table<R, C, V> {
         RowMapValues(R row) { this.row = row; }
         @Override public int size() { return ConcurrentHashTable.this.size(); }
         @Override public boolean contains(Object o) { return ConcurrentHashTable.this.containsValue((V) o); }
-        @Override public Iterator<V> iterator() {
+        @Override public @NotNull Iterator<V> iterator() {
             return new RowTableIterator<V>(row) {
                 @Override public V next() { return nextNode().value; }
             };

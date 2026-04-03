@@ -1,5 +1,8 @@
 package io.github.flameyossnowy.velocis.cache.multimap;
 
+import org.jetbrains.annotations.NotNull;
+
+@SuppressWarnings("unused")
 public final class Multimaps {
     private Multimaps() {
         throw new UnsupportedOperationException();
@@ -48,7 +51,7 @@ public final class Multimaps {
         };
     }
 
-    public static <K, V> Multimap<K, V> newConcurrentMultimap(AlgorithmType algorithmType, int maxSize, int concurrencyLevel, float loadFactor) {
+    public static <K, V> @NotNull Multimap<K, V> newConcurrentMultimap(@NotNull AlgorithmType algorithmType, int maxSize, int concurrencyLevel, float loadFactor) {
         return switch (algorithmType) {
             case CONCURRENT_LFU -> new ConcurrentLFUMultimap<>(maxSize, concurrencyLevel, loadFactor);
             case CONCURRENT_LRU -> new ConcurrentLRUMultimap<>(maxSize, concurrencyLevel, loadFactor);
@@ -57,15 +60,15 @@ public final class Multimaps {
         };
     }
 
-    public static <K, V> Multimap<K, V> newConcurrentMultimap(AlgorithmType algorithmType, int maxSize, int concurrencyLevel) {
+    public static <K, V> @NotNull Multimap<K, V> newConcurrentMultimap(AlgorithmType algorithmType, int maxSize, int concurrencyLevel) {
         return newConcurrentMultimap(algorithmType, maxSize, concurrencyLevel, 0.75F);
     }
 
-    public static <K, V> Multimap<K, V> newConcurrentMultimap(AlgorithmType algorithmType, int maxSize, float loadFactor) {
+    public static <K, V> @NotNull Multimap<K, V> newConcurrentMultimap(AlgorithmType algorithmType, int maxSize, float loadFactor) {
         return newConcurrentMultimap(algorithmType, maxSize, 1, loadFactor);
     }
 
-    public static <K, V> Multimap<K, V> newConcurrentMultimap(AlgorithmType algorithmType, int maxSize) {
+    public static <K, V> @NotNull Multimap<K, V> newConcurrentMultimap(AlgorithmType algorithmType, int maxSize) {
         return newConcurrentMultimap(algorithmType, maxSize, 1, 0.75F);
     }
 

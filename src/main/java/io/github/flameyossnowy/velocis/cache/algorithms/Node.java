@@ -1,12 +1,15 @@
 package io.github.flameyossnowy.velocis.cache.algorithms;
 
+import org.jetbrains.annotations.ApiStatus;
+
 import java.util.Map;
 
-class Node<K, V> implements Map.Entry<K, V> {
-    int frequency;
-    K key;
-    V value;
-    volatile Node<K, V> prev, next;
+@ApiStatus.Internal
+public class Node<K, V> implements Map.Entry<K, V> {
+    public K key;
+    public V value;
+    volatile Node<K, V> prev;
+    public volatile Node<K, V> next;
 
     public Node(K key, V value) {
         this.key = key;

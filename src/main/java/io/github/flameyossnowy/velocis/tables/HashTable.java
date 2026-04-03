@@ -1,5 +1,7 @@
 package io.github.flameyossnowy.velocis.tables;
 
+import org.jetbrains.annotations.NotNull;
+
 import java.lang.reflect.Array;
 import java.util.*;
 
@@ -23,7 +25,7 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
     private KeySet keySet;
     private Values values;
 
-    private Table.Entry<R, C, V>[] table;
+    private Node<R, C, V>[] table;
 
     private static final int INITIAL_CAPACITY = 16;
     private static final float LOAD_FACTOR = 0.75f;
@@ -69,7 +71,7 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         int newCapacity = table.length * 2;
 
         // Create the new table with the updated capacity
-        Table.Entry<R, C, V>[] newTable = new Table.Entry[newCapacity];
+        Node<R, C, V>[] newTable = new Node[newCapacity];
         Table.Entry<R, C, V>[] oldTable = this.table; // Reference to the old table
         this.table = newTable; // Update the table reference to the new one
 
@@ -86,11 +88,11 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
                     newTable[newHash] = new Node<>(current.row(), current.column(), current.value());
                 } else {
                     // Collision handling: traverse to the end of the chain and append the new node
-                    Table.Entry<R, C, V> node = newTable[newHash];
+                    Node<R, C, V> node = newTable[newHash];
                     while (node.next() != null) {
                         node = node.next();
                     }
-                    node.setNext(new Node<>(current.row(), current.column(), current.value()));
+                    node.next = new Node<>(current.row(), current.column(), current.value());
                 }
 
                 // Move to the next node in the current chain in the old table
@@ -107,8 +109,8 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
 
         int hash = this.hash(node.row(), node.column());
 
-        Table.Entry<R, C, V> current = table[hash];
-        Table.Entry<R, C, V> previous = null;
+        Node<R, C, V> current = table[hash];
+        Node<R, C, V> previous = null;
 
         while (current != null) {
             if (Objects.equals(current.row(), node.row()) && Objects.equals(current.column(), node.column())) {
@@ -127,7 +129,7 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
             table[hash] = newNode;
         } else {
             // Link to the previous node
-            previous.setNext(newNode);
+            previous.next = newNode;
         }
 
         size++;
@@ -184,6 +186,7 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
     @Override
     public void forEach(final Table.ForEach<? super R, ? super C, ? super V> action) {
         for (Table.Entry<R, C, V> node : table) {
+            if (node == null) continue;
             action.accept(node.row(), node.column(), node.value());
         }
     }
@@ -232,15 +235,15 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
     @Override
     public V remove(final R row, final C column) {
         int hash = hash(row, column);
-        Table.Entry<R, C, V> current = table[hash];
-        Table.Entry<R, C, V> prev = null;
+        Node<R, C, V> current = table[hash];
+        Node<R, C, V> prev = null;
 
         while (current != null) {
             if (Objects.equals(current.row(), row) && Objects.equals(current.column(), column)) {
                 if (prev == null) {
                     table[hash] = current.next();
                 } else {
-                    prev.setNext(current.next());
+                    prev.next = current.next();
                 }
                 size--;
                 modCount++;
@@ -307,17 +310,17 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         }
 
         @Override
-        public Iterator<KeyEntry<R, C>> iterator() {
+        public @NotNull Iterator<KeyEntry<R, C>> iterator() {
             return new KeyIterator();
         }
 
         @Override
-        public Object [] toArray() {
+        public Object @NotNull [] toArray() {
             return keysToArray(new Object[HashTable.this.size()]);
         }
 
         @Override
-        public <T> T [] toArray(final T [] ts) {
+        public <T> T @NotNull [] toArray(final T @NotNull [] ts) {
             return keysToArray(HashTable.this.prepareArray(ts));
         }
 
@@ -348,7 +351,7 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         }
 
         @Override
-        public boolean addAll(final Collection<? extends KeyEntry<R, C>> collection) {
+        public boolean addAll(final @NotNull Collection<? extends KeyEntry<R, C>> collection) {
             throw new UnsupportedOperationException();
         }
 
@@ -432,12 +435,27 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
 
         @Override
         public int size() {
-            return HashTable.this.size();
+            int count = 0;
+            Node<R, C, V>[] table = HashTable.this.table;
+            for (Node<R, C, V> node : table) {
+                while (node != null) {
+                    if (Objects.equals(node.row, row)) count++;
+                    node = node.next;
+                }
+            }
+            return count;
         }
 
         @Override
         public boolean isEmpty() {
-            return HashTable.this.isEmpty();
+            Node<R, C, V>[] table = HashTable.this.table;
+            for (Node<R, C, V> node : table) {
+                while (node != null) {
+                    if (Objects.equals(node.row, row)) return false;
+                    node = node.next;
+                }
+            }
+            return true;
         }
 
         @Override
@@ -480,17 +498,17 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         }
 
         @Override
-        public Set<C> keySet() {
+        public @NotNull Set<C> keySet() {
             return new RowMapKeySet(row);
         }
 
         @Override
-        public Collection<V> values() {
+        public @NotNull Collection<V> values() {
             return new RowMapValues(row);
         }
 
         @Override
-        public Set<Entry<C, V>> entrySet() {
+        public @NotNull Set<Entry<C, V>> entrySet() {
             return new RowMapEntries(row);
         }
     }
@@ -518,17 +536,17 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         }
 
         @Override
-        public Iterator<V> iterator() {
+        public @NotNull Iterator<V> iterator() {
             return new RowMapValueIterator(row);
         }
 
         @Override
-        public Object [] toArray() {
+        public Object @NotNull [] toArray() {
             return valuesToArray(new Object[HashTable.this.size()]);
         }
 
         @Override
-        public <T> T [] toArray(final T [] ts) {
+        public <T> T @NotNull [] toArray(final T @NotNull [] ts) {
             return valuesToArray(HashTable.this.prepareArray(ts));
         }
 
@@ -543,22 +561,22 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         }
 
         @Override
-        public boolean containsAll(final Collection<?> collection) {
+        public boolean containsAll(final @NotNull Collection<?> collection) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public boolean addAll(final Collection<? extends V> collection) {
+        public boolean addAll(final @NotNull Collection<? extends V> collection) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public boolean removeAll(final Collection<?> collection) {
+        public boolean removeAll(final @NotNull Collection<?> collection) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public boolean retainAll(final Collection<?> collection) {
+        public boolean retainAll(final @NotNull Collection<?> collection) {
             throw new UnsupportedOperationException();
         }
 
@@ -591,17 +609,17 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         }
 
         @Override
-        public Iterator<C> iterator() {
+        public @NotNull Iterator<C> iterator() {
             return new RowMapColumnIterator(row);
         }
 
         @Override
-        public Object [] toArray() {
+        public Object @NotNull [] toArray() {
             return valuesToArray(new Object[HashTable.this.size()]);
         }
 
         @Override
-        public <T> T [] toArray(final T [] ts) {
+        public <T> T @NotNull [] toArray(final T @NotNull [] ts) {
             return valuesToArray(HashTable.this.prepareArray(ts));
         }
 
@@ -616,22 +634,22 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         }
 
         @Override
-        public boolean containsAll(final Collection<?> collection) {
+        public boolean containsAll(final @NotNull Collection<?> collection) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public boolean addAll(final Collection<? extends C> collection) {
+        public boolean addAll(final @NotNull Collection<? extends C> collection) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public boolean removeAll(final Collection<?> collection) {
+        public boolean removeAll(final @NotNull Collection<?> collection) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public boolean retainAll(final Collection<?> collection) {
+        public boolean retainAll(final @NotNull Collection<?> collection) {
             throw new UnsupportedOperationException();
         }
 
@@ -664,17 +682,17 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         }
 
         @Override
-        public Iterator<Map.Entry<C, V>> iterator() {
+        public @NotNull Iterator<Map.Entry<C, V>> iterator() {
             return new RowMapEntryIterator(row);
         }
 
         @Override
-        public Object [] toArray() {
+        public Object @NotNull [] toArray() {
             return valuesToArray(new Object[HashTable.this.size()]);
         }
 
         @Override
-        public <T> T [] toArray(final T [] ts) {
+        public <T> T @NotNull [] toArray(final T @NotNull [] ts) {
             return valuesToArray(HashTable.this.prepareArray(ts));
         }
 
@@ -834,17 +852,17 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         }
 
         @Override
-        public Iterator<Entry<R, C, V>> iterator() {
+        public @NotNull Iterator<Entry<R, C, V>> iterator() {
             return new EntryIterator();
         }
 
         @Override
-        public Object [] toArray() {
+        public Object @NotNull [] toArray() {
             return entriesToArray(new Object[HashTable.this.size()]);
         }
 
         @Override
-        public <T> T [] toArray(final T [] ts) {
+        public <T> T @NotNull [] toArray(final T @NotNull [] ts) {
             return entriesToArray(HashTable.this.prepareArray(ts));
         }
 
@@ -931,17 +949,17 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         }
 
         @Override
-        public Iterator<V> iterator() {
+        public @NotNull Iterator<V> iterator() {
             return new ValueIterator();
         }
 
         @Override
-        public Object [] toArray() {
+        public Object @NotNull [] toArray() {
             return valuesToArray(new Object[HashTable.this.size()]);
         }
 
         @Override
-        public <T> T [] toArray(final T [] ts) {
+        public <T> T @NotNull [] toArray(final T @NotNull [] ts) {
             return valuesToArray(HashTable.this.prepareArray(ts));
         }
 
@@ -966,17 +984,17 @@ public class HashTable<R, C, V> implements Table<R, C, V> {
         }
 
         @Override
-        public boolean addAll(final Collection<? extends V> collection) {
+        public boolean addAll(final @NotNull Collection<? extends V> collection) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public boolean removeAll(final Collection<?> collection) {
+        public boolean removeAll(final @NotNull Collection<?> collection) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public boolean retainAll(final Collection<?> collection) {
+        public boolean retainAll(final @NotNull Collection<?> collection) {
             throw new UnsupportedOperationException();
         }
 

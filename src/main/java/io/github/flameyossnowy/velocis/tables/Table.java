@@ -246,12 +246,18 @@ public interface Table<R, C, V> {
         final C column;
         V value;
 
-        Entry<R, C, V> next;
+        Node<R, C, V> next;
 
         public Node(R row, C column, V value) {
             this.row = row;
             this.column = column;
             this.value = value;
+        }
+
+        public Node(Entry<R, C, V> entry) {
+            this.row = entry.row();
+            this.column = entry.column();
+            this.value = entry.value();
         }
 
         @Override
@@ -270,13 +276,13 @@ public interface Table<R, C, V> {
         }
 
         @Override
-        public Entry<R, C, V> next() {
+        public Node<R, C, V> next() {
             return next;
         }
 
         @Override
         public void setNext(Entry<R, C, V> rcvNode) {
-            this.next = rcvNode;
+            this.next = new Node<>(rcvNode);
         }
 
         @Override

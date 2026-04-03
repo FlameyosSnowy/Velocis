@@ -1,5 +1,7 @@
 package io.github.flameyossnowy.velocis.tables;
 
+import org.jetbrains.annotations.NotNull;
+
 import java.util.*;
 
 @SuppressWarnings({"unused"})
@@ -103,6 +105,13 @@ public class LinkedHashTable<R, C, V> extends HashTable<R, C, V> {
     }
 
     @Override
+    public void forEach(ForEach<? super R, ? super C, ? super V> action) {
+        for (Entry<R, C, V> rcvEntry : entrySet()) {
+            action.accept(rcvEntry.row(), rcvEntry.column(), rcvEntry.value());
+        }
+    }
+
+    @Override
     public Set<Entry<R, C, V>> entrySet() {
         return new LinkedEntrySet();
     }
@@ -118,17 +127,17 @@ public class LinkedHashTable<R, C, V> extends HashTable<R, C, V> {
         }
 
         @Override
-        public Set<Entry<C, V>> entrySet() {
+        public @NotNull Set<Entry<C, V>> entrySet() {
             return new LinkedRowEntrySet(row);
         }
 
         @Override
-        public Set<C> keySet() {
+        public @NotNull Set<C> keySet() {
             return new LinkedRowKeySet(row);
         }
 
         @Override
-        public Collection<V> values() {
+        public @NotNull Collection<V> values() {
             return new LinkedRowValueSet(row);
         }
     }
@@ -139,7 +148,7 @@ public class LinkedHashTable<R, C, V> extends HashTable<R, C, V> {
         }
 
         @Override
-        public Iterator<Map.Entry<C, V>> iterator() {
+        public @NotNull Iterator<Map.Entry<C, V>> iterator() {
             return new LinkedRowEntryIterator(row);
         }
     }
@@ -196,7 +205,7 @@ public class LinkedHashTable<R, C, V> extends HashTable<R, C, V> {
         }
 
         @Override
-        public Iterator<C> iterator() {
+        public @NotNull Iterator<C> iterator() {
             return new LinkedRowKeyIterator();
         }
     }
@@ -227,7 +236,7 @@ public class LinkedHashTable<R, C, V> extends HashTable<R, C, V> {
         }
 
         @Override
-        public Iterator<V> iterator() {
+        public @NotNull Iterator<V> iterator() {
             return new LinkedRowValueIterator();
         }
     }
@@ -257,7 +266,7 @@ public class LinkedHashTable<R, C, V> extends HashTable<R, C, V> {
     private class LinkedEntrySet extends EntrySet {
 
         @Override
-        public Iterator<Entry<R, C, V>> iterator() {
+        public @NotNull Iterator<Entry<R, C, V>> iterator() {
             return new LinkedEntryIterator();
         }
     }

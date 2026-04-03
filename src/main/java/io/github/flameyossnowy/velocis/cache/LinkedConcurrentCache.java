@@ -1,43 +1,17 @@
 package io.github.flameyossnowy.velocis.cache;
 
+import io.github.flameyossnowy.velocis.cache.algorithms.ConcurrentDoublyLinkedList;
+import io.github.flameyossnowy.velocis.cache.algorithms.Node;
+import org.jetbrains.annotations.NotNull;
+
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicReference;
 
 @SuppressWarnings("unused")
 public class LinkedConcurrentCache<K, V> extends AbstractMap<K, V> implements Map<K, V> {
-    private static class Node<K, V> implements Entry<K, V> {
-        final K key;
-        V value;
-        volatile Node<K, V> prev;
-        volatile Node<K, V> next;
-
-        Node(K key, V value) {
-            this.key = key;
-            this.value = value;
-        }
-
-        @Override
-        public K getKey() {
-            return key;
-        }
-
-        @Override
-        public V getValue() {
-            return value;
-        }
-
-        @Override
-        public V setValue(final V v) {
-            V oldValue = this.value;
-            this.value = v;
-            return oldValue;
-        }
-    }
 
     private final ConcurrentHashMap<K, Node<K, V>> map;
-    private final AtomicReference<Node<K, V>> head;
-    private final AtomicReference<Node<K, V>> tail;
+    private final ConcurrentDoublyLinkedList<K, V> concurrentDoublyLinkedList;
 
     private Values values;
     private EntrySet entrySet;
@@ -49,8 +23,7 @@ public class LinkedConcurrentCache<K, V> extends AbstractMap<K, V> implements Ma
 
     public LinkedConcurrentCache(int preallocatedSize, float loadFactor, int concurrencyLevel) {
         this.map = new ConcurrentHashMap<>(preallocatedSize, loadFactor, concurrencyLevel);
-        this.head = new AtomicReference<>();
-        this.tail = new AtomicReference<>();
+        this.concurrentDoublyLinkedList = new ConcurrentDoublyLinkedList<>();
     }
 
     public LinkedConcurrentCache(int preallocatedSize, int loadFactor) {
@@ -71,17 +44,17 @@ public class LinkedConcurrentCache<K, V> extends AbstractMap<K, V> implements Ma
     }
 
     @Override
-    public Set<K> keySet() {
+    public @NotNull Set<K> keySet() {
         return keySet == null ? (keySet = new KeySet()) : keySet;
     }
 
     @Override
-    public Collection<V> values() {
+    public @NotNull Collection<V> values() {
         return values == null ? (values = new Values()) : values;
     }
 
     @Override
-    public Set<Entry<K, V>> entrySet() {
+    public @NotNull Set<Entry<K, V>> entrySet() {
         return entrySet == null ? (entrySet = new EntrySet()) : entrySet;
     }
 
@@ -118,17 +91,17 @@ public class LinkedConcurrentCache<K, V> extends AbstractMap<K, V> implements Ma
             Node<K, V> oldNode = map.putIfAbsent(key, newNode);
             if (oldNode != null) {
                 oldNode.value = value;
-                moveToTail(oldNode);
+                this.concurrentDoublyLinkedList.moveToEnd(oldNode);
                 return value;
             }
-            addNodeToTail(newNode);
+            this.concurrentDoublyLinkedList.addToEnd(newNode);
         }
     }
 
     public V remove(Object key) {
         Node<K, V> node = map.remove(key);
         if (node != null) {
-            removeNode(node);
+            this.concurrentDoublyLinkedList.remove(node);
             return node.value;
         }
         return null;
@@ -143,52 +116,12 @@ public class LinkedConcurrentCache<K, V> extends AbstractMap<K, V> implements Ma
 
     public void clear() {
         map.clear();
-        head.set(null);
-        tail.set(null);
-    }
-
-    private void addNodeToTail(Node<K, V> node) {
-        Node<K, V> oldTail;
-        do {
-            oldTail = tail.get();
-            node.prev = oldTail;
-        } while (!tail.compareAndSet(oldTail, node));
-
-        if (oldTail != null) {
-            oldTail.next = node;
-        } else {
-            head.set(node);
-        }
-    }
-
-    private void removeNode(Node<K, V> node) {
-        Node<K, V> prev = node.prev;
-        Node<K, V> next = node.next;
-
-        if (prev != null) {
-            prev.next = next;
-        } else {
-            head.set(next);
-        }
-
-        if (next != null) {
-            next.prev = prev;
-        } else {
-            tail.set(prev);
-        }
-    }
-
-    private void moveToTail(Node<K, V> node) {
-        if (tail.get() == node) {
-            return;
-        }
-        removeNode(node);
-        addNodeToTail(node);
+        concurrentDoublyLinkedList.clear();
     }
 
     private class KeySet extends AbstractSet<K> {
         @Override
-        public Iterator<K> iterator() {
+        public @NotNull Iterator<K> iterator() {
             return new KeyIterator();
         }
 
@@ -213,7 +146,7 @@ public class LinkedConcurrentCache<K, V> extends AbstractMap<K, V> implements Ma
         }
 
         private class KeyIterator implements Iterator<K> {
-            private Node<K, V> current = head.get();
+            private Node<K, V> current = concurrentDoublyLinkedList.getHead().get();
             private Node<K, V> lastReturned;
 
             @Override
@@ -244,7 +177,7 @@ public class LinkedConcurrentCache<K, V> extends AbstractMap<K, V> implements Ma
 
     private class Values extends AbstractCollection<V> {
         @Override
-        public Iterator<V> iterator() {
+        public @NotNull Iterator<V> iterator() {
             return new ValueIterator();
         }
 
@@ -264,7 +197,7 @@ public class LinkedConcurrentCache<K, V> extends AbstractMap<K, V> implements Ma
         }
 
         private class ValueIterator implements Iterator<V> {
-            private Node<K, V> current = head.get();
+            private Node<K, V> current = concurrentDoublyLinkedList.getHead().get();
             private Node<K, V> lastReturned;
 
             @Override
@@ -295,7 +228,7 @@ public class LinkedConcurrentCache<K, V> extends AbstractMap<K, V> implements Ma
 
     private class EntrySet extends AbstractSet<Entry<K, V>> {
         @Override
-        public Iterator<Entry<K, V>> iterator() {
+        public @NotNull Iterator<Entry<K, V>> iterator() {
             return new EntryIterator();
         }
 
@@ -328,7 +261,7 @@ public class LinkedConcurrentCache<K, V> extends AbstractMap<K, V> implements Ma
         }
 
         private class EntryIterator implements Iterator<Entry<K, V>> {
-            private Node<K, V> current = head.get();
+            private Node<K, V> current = concurrentDoublyLinkedList.getHead().get();
             private Node<K, V> lastReturned;
 
             @Override
