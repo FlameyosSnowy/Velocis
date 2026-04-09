@@ -5,8 +5,6 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicIntegerArray;
-import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.locks.StampedLock;
 
 import static io.github.flameyossnowy.velocis.cache.algorithms.ConcurrentLFRUCache.probe0;
@@ -165,7 +163,6 @@ public class ConcurrentLFUCache<K, V> implements Map<K, V> {
         }
     }
 
-    // Called under write lock
     private void evictLFU() {
         int minFreq  = Integer.MAX_VALUE;
         int minSlot  = -1;
@@ -206,7 +203,13 @@ public class ConcurrentLFUCache<K, V> implements Map<K, V> {
         return probe0(h, hs, mask, EMPTY, TOMBSTONE);
     }
 
-    @Override public void putAll(Map<? extends K, ? extends V> m) { m.forEach(this::put); }
+    @Override public void putAll(Map<? extends K, ? extends V> m) {
+        for (Entry<? extends K, ? extends V> entry : m.entrySet()) {
+            K key = entry.getKey();
+            V value = entry.getValue();
+            put(key, value);
+        }
+    }
 
     @Override
     public void clear() {
@@ -215,8 +218,8 @@ public class ConcurrentLFUCache<K, V> implements Map<K, V> {
             Arrays.fill(hashes, EMPTY);
             Arrays.fill(keys,   null);
             Arrays.fill(values, null);
-            Arrays.fill(freqs,  0);
-            liveCount.set(0);
+            Arrays.fill(freqs,  EMPTY);
+            liveCount.set(EMPTY);
         } finally {
             lock.unlockWrite(stamp);
         }
@@ -231,12 +234,14 @@ public class ConcurrentLFUCache<K, V> implements Map<K, V> {
             for (int i = 0; i < capacity; i++)
                 if (hashes[i] > 0 && v.equals(values[i])) return true;
             return false;
-        } finally { lock.unlockRead(stamp); }
+        } finally {
+            lock.unlockRead(stamp);
+        }
     }
 
-    @Override public Set<K>          keySet()   { return new KeySetView(); }
-    @Override public Collection<V>   values()   { return new ValuesView(); }
-    @Override public Set<Entry<K,V>> entrySet() { return new EntrySetView(); }
+    @Override public @NotNull Set<K>          keySet()   { return new KeySetView(); }
+    @Override public @NotNull Collection<V>   values()   { return new ValuesView(); }
+    @Override public @NotNull Set<Entry<K, V>> entrySet() { return new EntrySetView(); }
 
     private abstract class SlotIterator<T> implements Iterator<T> {
         int cursor = 0;
@@ -263,26 +268,40 @@ public class ConcurrentLFUCache<K, V> implements Map<K, V> {
 
     private final class KeySetView extends AbstractSet<K> {
         @Override public int size() { return liveCount.get(); }
-        @Override public Iterator<K> iterator() {
+        @Override public @NotNull Iterator<K> iterator() {
             long stamp = lock.readLock();
-            try { return new SlotIterator<K>() { @Override K extract(int i) { return (K) keys[i]; } }; }
-            finally { lock.unlockRead(stamp); }
+            try {
+                return new SlotIterator<K>() {
+                    @Override K extract(int i) {
+                        return (K) keys[i];
+                    }
+                };
+            } finally {
+                lock.unlockRead(stamp);
+            }
         }
         @Override public boolean contains(Object o) { return containsKey(o); }
     }
 
     private final class ValuesView extends AbstractCollection<V> {
         @Override public int size() { return liveCount.get(); }
-        @Override public Iterator<V> iterator() {
+        @Override public @NotNull Iterator<V> iterator() {
             long stamp = lock.readLock();
-            try { return new SlotIterator<V>() { @Override V extract(int i) { return (V) values[i]; } }; }
-            finally { lock.unlockRead(stamp); }
+            try {
+                return new SlotIterator<V>() {
+                    @Override V extract(int i) {
+                        return (V) values[i];
+                    }
+                };
+            } finally {
+                lock.unlockRead(stamp);
+            }
         }
     }
 
     private final class EntrySetView extends AbstractSet<Entry<K,V>> {
         @Override public int size() { return liveCount.get(); }
-        @Override public Iterator<Entry<K,V>> iterator() {
+        @Override public @NotNull Iterator<Entry<K,V>> iterator() {
             long stamp = lock.readLock();
             try {
                 return new SlotIterator<Entry<K,V>>() {
@@ -290,7 +309,9 @@ public class ConcurrentLFUCache<K, V> implements Map<K, V> {
                         return Map.entry((K) keys[i], (V) values[i]);
                     }
                 };
-            } finally { lock.unlockRead(stamp); }
+            } finally {
+                lock.unlockRead(stamp);
+            }
         }
     }
 

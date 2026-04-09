@@ -1,316 +1,300 @@
 package io.github.flameyossnowy.velocis.cache.algorithms;
 
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.StampedLock;
+
+import static io.github.flameyossnowy.velocis.cache.algorithms.ConcurrentLFUCache.nextPow2;
 
 /**
- * Raw LRU Cache implementation using a HashMap and Doubly Linked List.
- * Does NOT rely on LinkedHashMap's accessOrder feature.
+ * Concurrent LRU Cache — Structure-of-Arrays open-addressing hash table
+ * guarded by a StampedLock, with LRU ordering tracked by the lock-free
+ * ConcurrentDoublyLinkedList.
+ * <p>
+ * Layout (all arrays share the same slot index):
+ *   int[]    hashes   — spread hash; 0 = empty, -1 = tombstone
+ *   Object[] keys     — key at slot i
+ *   Object[] values   — value at slot i
+ *   Node[]   nodes    — corresponding DLL node for LRU tracking
+ * <p>
+ * Reads use optimistic stamps with fallback to a read lock.
+ * Writes (put / remove / evict) take the write lock.
+ * LRU list mutations (moveToEnd, removeHead) are lock-free via CAS inside
+ * ConcurrentDoublyLinkedList — they happen outside the write lock where
+ * possible to reduce contention.
  */
+@SuppressWarnings("unchecked")
 public class ConcurrentLRUCache<K, V> implements Map<K, V> {
+
+    private static final int   EMPTY     =  0;
+    private static final int   TOMBSTONE = -1;
+    private static final float LOAD      = 0.70f;
+
+    private final int[]    hashes;
+    private final Object[] keys;
+    private final Object[] values;
+    private final ConcurrentDoublyLinkedList.Node<K, V>[] nodes;
+
+    private final int capacity;
+    private final int mask;
     private final int maxSize;
-    private final Map<K, Map.Entry<K, V>> cache;
-    private final ConcurrentDoublyLinkedList<K, V> list;
 
-    private Values values;
-    private EntrySet entrySet;
+    private final StampedLock              lock      = new StampedLock();
+    private final AtomicInteger            liveCount = new AtomicInteger(0);
+    private final ConcurrentDoublyLinkedList<K, V> list = new ConcurrentDoublyLinkedList<>();
 
-    private static final int INITIAL_CONCURRENCY_LEVEL = 1;
-    private static final int INITIAL_CAPACITY = 16;
-    private static final float INITIAL_LOAD_FACTOR =  0.75F;
-
-    public ConcurrentLRUCache(int maxSize, int concurrencyLevel, float loadFactor) {
-        if (maxSize <= 0) throw new IllegalArgumentException("Cache size must be greater than 0");
-        this.maxSize = maxSize;
-        this.cache = new ConcurrentHashMap<>(concurrencyLevel, loadFactor);
-        this.list = new ConcurrentDoublyLinkedList<>();
-    }
-
-    public ConcurrentLRUCache(int maxSize, int concurrencyLevel) {
-        this(maxSize, concurrencyLevel, INITIAL_LOAD_FACTOR);
-    }
-
-    public ConcurrentLRUCache(int maxSize, float loadFactor) {
-        this(maxSize, INITIAL_CONCURRENCY_LEVEL, loadFactor);
-    }
+    private transient volatile KeySetView   keySetView;
+    private transient volatile ValuesView   valuesView;
+    private transient volatile EntrySetView entrySetView;
 
     public ConcurrentLRUCache(int maxSize) {
-        this(maxSize, INITIAL_CONCURRENCY_LEVEL, INITIAL_LOAD_FACTOR);
+        if (maxSize <= 0) throw new IllegalArgumentException("maxSize must be > 0");
+        this.maxSize  = maxSize;
+        this.capacity = nextPow2((int) (maxSize / LOAD) + 1);
+        this.mask     = capacity - 1;
+        this.hashes   = new int[capacity];
+        this.keys     = new Object[capacity];
+        this.values   = new Object[capacity];
+        this.nodes    = new ConcurrentDoublyLinkedList.Node[capacity];
     }
 
-    public ConcurrentLRUCache() {
-        this(INITIAL_CAPACITY, INITIAL_CONCURRENCY_LEVEL, INITIAL_LOAD_FACTOR);
+    public ConcurrentLRUCache()                                        { this(16); }
+    public ConcurrentLRUCache(int maxSize, int ignored)                { this(maxSize); }
+    public ConcurrentLRUCache(int maxSize, float ignored)              { this(maxSize); }
+    public ConcurrentLRUCache(int maxSize, int ignored, float ignored2){ this(maxSize); }
+
+    @Override
+    public @Nullable V get(Object key) {
+        int h = spread(key.hashCode());
+
+        long stamp = lock.tryOptimisticRead();
+        int idx = findSlot(h, key);
+        V   val = idx >= 0 ? (V) values[idx] : null;
+        ConcurrentDoublyLinkedList.Node<K, V> node = idx >= 0 ? nodes[idx] : null;
+
+        if (!lock.validate(stamp)) {
+            stamp = lock.readLock();
+            try {
+                idx  = findSlot(h, key);
+                val  = idx >= 0 ? (V) values[idx] : null;
+                node = idx >= 0 ? nodes[idx] : null;
+            } finally {
+                lock.unlockRead(stamp);
+            }
+        }
+
+        if (node != null) list.moveToEnd(node);
+        return val;
     }
 
     @Override
-    public V get(Object key) {
-        if (!cache.containsKey(key)) return null;
-
-        Node<K, V> node = (Node<K, V>) cache.get(key);
-        list.moveToEnd(node);  // Mark as most recently used
-        return node.value;
-    }
-
-    @Override
-    public V put(K key, V value) {
+    public @Nullable V put(K key, V value) {
         if (value == null) throw new IllegalArgumentException("Null values are not allowed");
+        int h = spread(key.hashCode());
 
-        if (cache.containsKey(key)) {
-            Node<K, V> node = (Node<K, V>) cache.get(key);
-            V temp = node.value;
-            node.value = value;
-            list.moveToEnd(node);
-            return temp;
+        long stamp = lock.writeLock();
+        try {
+            int idx = findSlot(h, key);
+            if (idx >= 0) {
+                V old = (V) values[idx];
+                values[idx] = value;
+                ConcurrentDoublyLinkedList.Node<K, V> node = nodes[idx];
+                // promote outside lock after we've finished mutating the table
+                lock.unlockWrite(stamp);
+                stamp = 0L;
+                list.moveToEnd(node);
+                return old;
+            }
+
+            if (liveCount.get() >= maxSize) evictLRU();
+
+            int slot = probeInsert(h);
+            ConcurrentDoublyLinkedList.Node<K, V> node = list.addToEnd(key, value);
+            hashes[slot] = h;
+            keys  [slot] = key;
+            values[slot] = value;
+            nodes [slot] = node;
+            liveCount.incrementAndGet();
+            return null;
+        } finally {
+            if (stamp != 0L) lock.unlockWrite(stamp);
         }
-
-        if (cache.size() >= maxSize) evictLRU();
-
-        Node<K, V> newNode = list.addToEnd(key, value);
-        cache.put(key, newNode);
-        return null;
     }
 
     @Override
-    public V remove(Object key) {
-        Node<K, V> node = (Node<K, V>) cache.remove(key);
-        list.remove(node);
-        return node == null ? null : node.value;
+    public @Nullable V remove(Object key) {
+        int h = spread(key.hashCode());
+        long stamp = lock.writeLock();
+        try {
+            int idx = findSlot(h, key);
+            if (idx < 0) return null;
+
+            V old = (V) values[idx];
+            ConcurrentDoublyLinkedList.Node<K, V> node = nodes[idx];
+
+            hashes[idx] = TOMBSTONE;
+            keys  [idx] = null;
+            values[idx] = null;
+            nodes [idx] = null;
+            liveCount.decrementAndGet();
+
+            // remove from LRU list outside table lock
+            lock.unlockWrite(stamp);
+            stamp = 0L;
+            list.remove(node);
+            return old;
+        } finally {
+            if (stamp != 0L) lock.unlockWrite(stamp);
+        }
     }
 
     @Override
-    public void putAll(final Map<? extends K, ? extends V> map) {
-        for (Entry<? extends K, ? extends V> entry : map.entrySet()) {
-            this.put(entry.getKey(), entry.getValue());
-        }
+    public void putAll(Map<? extends K, ? extends V> m) {
+        m.forEach(this::put);
     }
 
     @Override
     public void clear() {
-        cache.clear();
-        list.clear();
+        long stamp = lock.writeLock();
+        try {
+            Arrays.fill(hashes, EMPTY);
+            Arrays.fill(keys,   null);
+            Arrays.fill(values, null);
+            Arrays.fill(nodes,  null);
+            liveCount.set(0);
+            list.clear();
+        } finally {
+            lock.unlockWrite(stamp);
+        }
     }
+
+    @Override public int     size()                   { return liveCount.get(); }
+    @Override public boolean isEmpty()                { return liveCount.get() == 0; }
+    @Override public boolean containsKey(Object key)  { return get(key) != null; }
 
     @Override
-    public Set<K> keySet() {
-        return cache.keySet();
+    public boolean containsValue(Object v) {
+        long stamp = lock.readLock();
+        try {
+            for (int i = 0; i < capacity; i++)
+                if (hashes[i] > 0 && v.equals(values[i])) return true;
+            return false;
+        } finally {
+            lock.unlockRead(stamp);
+        }
     }
 
-    @Override
-    public Collection<V> values() {
-        return (values == null) ? (values = new Values()) : values;
-    }
+    @Override public @NotNull Set<K>           keySet()   { return keySetView   == null ? (keySetView   = new KeySetView())   : keySetView;   }
+    @Override public @NotNull Collection<V>    values()   { return valuesView   == null ? (valuesView   = new ValuesView())   : valuesView;   }
+    @Override public @NotNull Set<Entry<K, V>> entrySet() { return entrySetView == null ? (entrySetView = new EntrySetView()) : entrySetView; }
 
-    @Override
-    public Set<Entry<K, V>> entrySet() {
-        return entrySet == null ? (entrySet = new EntrySet()) : entrySet;
-    }
-
-    @Override
-    public int size() {
-        return cache.size();
-    }
-
-    @Override
-    public boolean containsKey(Object key) {
-        return cache.containsKey(key);
-    }
-
-    @Override
-    public boolean containsValue(final Object o) {
-        return cache.containsValue(o);
-    }
-
-    @Override
-    public boolean isEmpty() {
-        return cache.isEmpty();
-    }
-
+    /** Evicts the least-recently-used entry. Caller must hold write lock. */
     private void evictLRU() {
-        Node<K, V> lruNode = list.removeHead();
-        if (lruNode != null) cache.remove(lruNode.key);
+        ConcurrentDoublyLinkedList.Node<K, V> lru = list.removeHead();
+        if (lru == null) return;
+        int h   = spread(lru.key.hashCode());
+        int idx = findSlot(h, lru.key);
+        if (idx < 0) return;
+        hashes[idx] = TOMBSTONE;
+        keys  [idx] = null;
+        values[idx] = null;
+        nodes [idx] = null;
+        liveCount.decrementAndGet();
     }
 
-    private class Values implements Collection<V> {
-        @Override
-        public int size() {
-            return ConcurrentLRUCache.this.cache.size();
+    /** Linear probe — returns slot if key found, -1 otherwise. */
+    private int findSlot(int h, Object key) {
+        int i = h & mask;
+        for (int probe = 0; probe <= mask; probe++) {
+            int sh = hashes[i];
+            if (sh == EMPTY) return -1;
+            if (sh == h && key.equals(keys[i])) return i;
+            i = (i + 1) & mask;
         }
-
-        @Override
-        public boolean contains(Object o) {
-            return ConcurrentLRUCache.this.cache.containsValue(o);
-        }
-
-        @Override
-        public boolean containsAll(Collection<?> c) {
-            return ConcurrentLRUCache.this.cache.containsValue(c);
-        }
-
-        @Override
-        public boolean addAll(final Collection<? extends V> collection) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean removeAll(final Collection<?> collection) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean retainAll(final Collection<?> collection) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public void clear() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return ConcurrentLRUCache.this.cache.isEmpty();
-        }
-
-        @Override
-        public Iterator<V> iterator() {
-            return new ValuesIterator();
-        }
-
-        @Override
-        public Object[] toArray() {
-            return ConcurrentLRUCache.this.cache.values().toArray();
-        }
-
-        @Override
-        public <T> T[] toArray(T[] a) {
-            return ConcurrentLRUCache.this.cache.values().toArray(a);
-        }
-
-        @Override
-        public boolean add(final V v) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean remove(final Object o) {
-            throw new UnsupportedOperationException();
-        }
+        return -1;
     }
 
-    private class ValuesIterator implements Iterator<V> {
-        private final Iterator<Map.Entry<K, V>> iterator = ConcurrentLRUCache.this.cache.values().iterator();
+    /** Linear probe — returns first empty or tombstone slot for insertion. */
+    private int probeInsert(int h) {
+        return ConcurrentLFRUCache.probe0(h, hashes, mask, EMPTY, TOMBSTONE);
+    }
 
-        @Override
-        public boolean hasNext() {
-            return iterator.hasNext();
+    private static int spread(int h) {
+        h ^= (h >>> 16);
+        h &= 0x7FFF_FFFF;
+        return h == 0 ? 1 : h;
+    }
+
+    private abstract class SlotIterator<T> implements Iterator<T> {
+        int cursor = 0;
+        int current = -1;
+
+        SlotIterator() { advance(); }
+
+        private void advance() {
+            while (cursor < capacity && hashes[cursor] <= 0) cursor++;
+            current = cursor < capacity ? cursor++ : -1;
         }
 
-        @Override
-        public V next() {
-            return iterator.next().getValue();
+        @Override public boolean hasNext() { return current >= 0; }
+
+        @Override public T next() {
+            if (current < 0) throw new NoSuchElementException();
+            int i = current;
+            advance();
+            return extract(i);
         }
 
-        @Override
-        public void remove() {
-            iterator.remove();
+        abstract T extract(int i);
+    }
+
+    private final class KeySetView extends AbstractSet<K> {
+        @Override public int  size()              { return liveCount.get(); }
+        @Override public boolean contains(Object o) { return containsKey(o); }
+        @Override public boolean remove(Object o)   { return ConcurrentLRUCache.this.remove(o) != null; }
+        @Override public void clear()               { ConcurrentLRUCache.this.clear(); }
+        @Override public @NotNull Iterator<K> iterator() {
+            long stamp = lock.readLock();
+            try { return new SlotIterator<K>() { @Override K extract(int i) { return (K) keys[i]; } }; }
+            finally { lock.unlockRead(stamp); }
         }
     }
 
-    private class EntrySet implements Set<Entry<K, V>> {
-        @Override
-        public int size() {
-            return ConcurrentLRUCache.this.cache.size();
+    private final class ValuesView extends AbstractCollection<V> {
+        @Override public int  size()              { return liveCount.get(); }
+        @Override public boolean contains(Object o) { return containsValue(o); }
+        @Override public void clear()               { ConcurrentLRUCache.this.clear(); }
+        @Override public @NotNull Iterator<V> iterator() {
+            long stamp = lock.readLock();
+            try { return new SlotIterator<V>() { @Override V extract(int i) { return (V) values[i]; } }; }
+            finally { lock.unlockRead(stamp); }
         }
+    }
 
-        @Override
-        public boolean contains(Object o) {
-            return ConcurrentLRUCache.this.cache.containsValue(((Map.Entry<K, V>) o).getValue());
+    private final class EntrySetView extends AbstractSet<Entry<K, V>> {
+        @Override public int  size()              { return liveCount.get(); }
+        @Override public void clear()             { ConcurrentLRUCache.this.clear(); }
+        @Override public boolean contains(Object o) {
+            if (!(o instanceof Map.Entry<?, ?> e)) return false;
+            V v = get(e.getKey());
+            return v != null && v.equals(e.getValue());
         }
-
-        @Override
-        public boolean containsAll(Collection<?> c) {
-            for (Object o : c) {
-                if (!(o instanceof Map.Entry<?, ?> entry)) {
-                    return false;
-                }
-                if (!ConcurrentLRUCache.this.cache.containsValue(entry.getValue())) {
-                    return false;
-                }
-            }
-            return true;
+        @Override public boolean remove(Object o) {
+            if (!(o instanceof Map.Entry<?, ?> e)) return false;
+            return ConcurrentLRUCache.this.remove(e.getKey()) != null;
         }
-
-        @Override
-        public boolean addAll(final Collection<? extends Entry<K, V>> collection) {
-            boolean modified = false;
-            for (Entry<K, V> entry : collection) {
-                modified |= ConcurrentLRUCache.this.put(entry.getKey(), entry.getValue()) == null;
-            }
-            return modified;
-        }
-
-        @Override
-        public boolean retainAll(final Collection<?> collection) {
-            boolean modified = false;
-            for (Object o : collection) {
-                if (!(o instanceof Map.Entry<?, ?> entry)) {
-                    continue;
-                }
-                if (collection.contains(ConcurrentLRUCache.this.get(entry.getKey()))) {
-                    continue;
-                }
-                modified |= ConcurrentLRUCache.this.remove(entry.getKey()) != null;
-            }
-            return modified;
-        }
-
-        @Override
-        public boolean removeAll(final Collection<?> collection) {
-            boolean modified = false;
-            for (Object o : collection) {
-                if (!(o instanceof Map.Entry<?, ?> entry)) {
-                    continue;
-                }
-                modified |= ConcurrentLRUCache.this.remove(entry.getKey()) != null;
-            }
-            return modified;
-        }
-
-        @Override
-        public void clear() {
-            ConcurrentLRUCache.this.clear();
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return ConcurrentLRUCache.this.cache.isEmpty();
-        }
-
-        @Override
-        public Iterator<Entry<K, V>> iterator() {
-            return ConcurrentLRUCache.this.cache.values().iterator();
-        }
-
-        @Override
-        public Object[] toArray() {
-            return ConcurrentLRUCache.this.cache.values().toArray();
-        }
-
-        @Override
-        public <T> T[] toArray(final T[] ts) {
-            return ConcurrentLRUCache.this.cache.values().toArray(ts);
-        }
-
-        @Override
-        public boolean add(final Entry<K, V> kvEntry) {
-            return ConcurrentLRUCache.this.put(kvEntry.getKey(), kvEntry.getValue()) == null;
-        }
-
-        @Override
-        public boolean remove(final Object o) {
-            Map.Entry<K, V> entry = (Map.Entry<K, V>) o;
-            return ConcurrentLRUCache.this.remove(entry.getKey()) != null;
+        @Override public @NotNull Iterator<Entry<K, V>> iterator() {
+            long stamp = lock.readLock();
+            try {
+                return new SlotIterator<Entry<K, V>>() {
+                    @Override Entry<K, V> extract(int i) {
+                        return Map.entry((K) keys[i], (V) values[i]);
+                    }
+                };
+            } finally { lock.unlockRead(stamp); }
         }
     }
 }

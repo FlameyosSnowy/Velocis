@@ -1,5 +1,6 @@
 package io.github.flameyossnowy.velocis.cache.algorithms;
 
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.*;
@@ -39,8 +40,8 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
     private static final float LOAD      = 0.70f;
 
     private int[]    hashes;
-    private Object[] keys;
-    private Object[] values;
+    private K[] keys;
+    private V[] values;
     private int[]    freqs;
     private long[]   lastUsed;
 
@@ -67,8 +68,8 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
 
     private void allocArrays(int cap) {
         hashes   = new int   [cap];
-        keys     = new Object[cap];
-        values   = new Object[cap];
+        keys     = (K[]) new Object[cap];
+        values   = (V[]) new Object[cap];
         freqs    = new int   [cap];
         lastUsed = new long  [cap];
     }
@@ -252,9 +253,9 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
         } finally { lock.unlockRead(stamp); }
     }
 
-    @Override public Set<K>          keySet()   { return new KeySetView(); }
-    @Override public Collection<V>   values()   { return new ValuesView(); }
-    @Override public Set<Entry<K,V>> entrySet() { return new EntrySetView(); }
+    @Override public @NotNull Set<K>          keySet()   { return new KeySetView(); }
+    @Override public @NotNull Collection<V>   values()   { return new ValuesView(); }
+    @Override public @NotNull Set<Entry<K,V>> entrySet() { return new EntrySetView(); }
 
     private abstract class SlotIterator<T> implements Iterator<T> {
         int cursor = 0;
@@ -296,13 +297,15 @@ public class ConcurrentLFRUCache<K, V> implements Map<K, V> {
         @Override public Iterator<Entry<K,V>> iterator() {
             long s = lock.readLock(); try {
                 return new SlotIterator<Entry<K,V>>() {
-                    @Override Entry<K,V> extract(int i) { return Map.entry((K) keys[i], (V) values[i]); }
+                    @Override Entry<K,V> extract(int i) {
+                        return Map.entry(keys[i], values[i]);
+                    }
                 };
             } finally { lock.unlockRead(s); }
         }
     }
 
-    static int nextPow2(int n) {
+    public static int nextPow2(int n) {
         if (n <= 1) return 2;
         n--; n |= n>>>1; n |= n>>>2; n |= n>>>4; n |= n>>>8; n |= n>>>16;
         return n + 1;
